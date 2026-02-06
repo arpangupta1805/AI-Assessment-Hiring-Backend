@@ -1,0 +1,88 @@
+{
+  "questions": [
+    {
+      "questionid": "Q001",
+      "questiontxt": "Write a function that calculates the factorial of a number. Example: factorial(5) should return 120",
+      "difficulty": "easy",
+      "role": "SDE 1",
+      "company": "Google",
+      "estimated_time": 15,
+      "constraints": [
+        "1 <= n <= 20",
+        "You must return an integer",
+        "Handle edge cases properly"
+      ],
+  "howtoapproach": "Use either recursion or iteration. The recursive approach is elegant but iteration is more efficient. Think about base cases and how the number decreases with each call/iteration.",
+  "optimal_solution": "def factorial(n):\n    if n <= 1:\n        return 1\n    return n * factorial(n - 1)",
+      "visible_testcases": {
+        "case_1": {
+          "input": "5",
+          "output": "120"
+        },
+        "case_2": {
+          "input": "0",
+          "output": "1"
+        },
+        "case_3": {
+          "input": "1",
+          "output": "1"
+        }
+      },
+      "hidden_testcases": {
+        "case_4": {
+          "input": "10",
+          "output": "3628800"
+        },
+        "case_5": {
+          "input": "3",
+          "output": "6"
+        }
+      },
+      "edge_testcases": {
+        "case_6": {
+          "input": "20",
+          "output": "2432902008176640000"
+        }
+      }
+    },
+    {
+      "questionid": "Q002",
+      "questiontxt": "Given an array of integers, find two numbers that add up to a target sum.",
+      "difficulty": "easy",
+      "role": "SDE 1",
+      "company": "Amazon",
+      "estimated_time": 20,
+      "constraints": [
+        "2 <= arr.length <= 10000",
+        "-10^9 <= arr[i] <= 10^9",
+        "-10^9 <= target <= 10^9",
+        "Each input has exactly one solution",
+        "You cannot use the same element twice"
+      ],
+  "howtoapproach": "Use a hash map to store numbers you've seen. For each number, check if (target - current_number) exists in the map. This gives O(n) time complexity.",
+  "optimal_solution": "def find_sum_pair(arr, target):\n    seen = set()\n    for num in arr:\n        if target - num in seen:\n            return [target - num, num]\n        seen.add(num)\n    return []",
+      "visible_testcases": {
+        "case_1": {
+          "input": "[2,7,11,15]\n9",
+          "output": "[2,7]"
+        },
+        "case_2": {
+          "input": "[3,3]\n6",
+          "output": "[3,3]"
+        }
+      },
+      "hidden_testcases": {
+        "case_3": {
+          "input": "[1,2,3,4,5]\n9",
+          "output": "[4,5]"
+        }
+      },
+      "edge_testcases": {
+        "case_4": {
+          "input": "[-1000000000,1000000000]\n0",
+          "output": "[-1000000000,1000000000]"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "questionid": "twosum-001",
+  "questiontxt": "Given an array of integers nums and an integer target, return the indices of the two numbers that add up to the target. You may assume that each input has exactly one solution, and you may not use the same element twice. You can return the answer in any order.",
+  "company": "Amazon",
+  "role": "SDE 1",
+  "difficulty": "easy",
+  "estimated_time": 15,
+  "constraints": [
+    "2 <= nums.length <= 10^4",
+    "-10^9 <= nums[i] <= 10^9",
+    "-10^9 <= target <= 10^9",
+    "Only one valid answer exists."
+  ],
+  "howtoapproach": "Approach 1 (Brute Force): Check every pair of numbers. Time: O(n^2), Space: O(1)\n\nApproach 2 (Hash Map): Use a hash map to store numbers and their indices. For each number, check if (target - number) exists in the map. Time: O(n), Space: O(n)\n\nThe hash map approach is optimal.",
+  "optimal_solution": "def twoSum(nums, target):\n    num_map = {}\n    for i, num in enumerate(nums):\n        complement = target - num\n        if complement in num_map:\n            return [num_map[complement], i]\n        num_map[num] = i\n    return []",
+  "solution": "def twoSum(nums, target):\n    # Write your solution here\n    # You can use a hash map to store numbers and their indices\n    # For each number, check if (target - number) exists in the map\n    pass",
+  "visible_testcases": {
+    "test_1": {
+      "input": "nums = [2,7,11,15], target = 9",
+      "output": "[0,1]"
+    },
+    "test_2": {
+      "input": "nums = [3,2,4], target = 6",
+      "output": "[1,2]"
+    },
+    "test_3": {
+      "input": "nums = [3,3], target = 6",
+      "output": "[0,1]"
+    }
+  },
+  "hidden_testcases": {
+    "test_1": {
+      "input": "nums = [1,2,3,4,5], target = 9",
+      "output": "[3,4]"
+    },
+    "test_2": {
+      "input": "nums = [-1,-2,-3,-4,-5], target = -8",
+      "output": "[0,4]"
+    },
+    "test_3": {
+      "input": "nums = [1000000,1000000], target = 2000000",
+      "output": "[0,1]"
+    }
+  },
+  "edge_testcases": {
+    "test_1": {
+      "input": "nums = [-10^9, 10^9], target = 0",
+      "output": "[0,1]"
+    },
+    "test_2": {
+      "input": "nums = [0,0], target = 0",
+      "output": "[0,1]"
+    }
+  }
+}

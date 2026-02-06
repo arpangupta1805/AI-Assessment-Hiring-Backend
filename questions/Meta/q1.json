@@ -1,0 +1,53 @@
+{
+  "questionid": "longestsubstring-001",
+  "questiontxt": "Given a string s, find the length of the longest substring without repeating characters.",
+  "company": "Meta",
+  "role": "SDE 1",
+  "difficulty": "medium",
+  "estimated_time": 20,
+  "constraints": [
+    "0 <= s.length <= 10^5",
+    "s consists of English letters, digits, symbols and spaces."
+  ],
+  "howtoapproach": "Approach 1 (Brute Force): Check all substrings and verify if each has unique characters. Time: O(n^3), Space: O(min(n, m)).\n\nApproach 2 (Sliding Window + Hash Set): Expand the window while characters are unique, shrink when duplicates appear. Time: O(n), Space: O(min(n, m)).\n\nApproach 3 (Optimized Sliding Window + Hash Map): Track last seen index of characters to skip directly. Time: O(n), Space: O(min(n, m)). The optimized sliding window using a hash map is the best approach.",
+  "optimal_solution": "def lengthOfLongestSubstring(s):\n    char_index = {}\n    left = 0\n    max_len = 0\n    for right, ch in enumerate(s):\n        if ch in char_index and char_index[ch] >= left:\n            left = char_index[ch] + 1\n        char_index[ch] = right\n        max_len = max(max_len, right - left + 1)\n    return max_len",
+  "solution": " ",
+  "visible_testcases": {
+    "test_1": {
+      "input": "s = \"abcabcbb\"",
+      "output": "3"
+    },
+    "test_2": {
+      "input": "s = \"bbbbb\"",
+      "output": "1"
+    },
+    "test_3": {
+      "input": "s = \"pwwkew\"",
+      "output": "3"
+    }
+  },
+  "hidden_testcases": {
+    "test_1": {
+      "input": "s = \"abcdefg\"",
+      "output": "7"
+    },
+    "test_2": {
+      "input": "s = \"abba\"",
+      "output": "2"
+    },
+    "test_3": {
+      "input": "s = \"dvdf\"",
+      "output": "3"
+    }
+  },
+  "edge_testcases": {
+    "test_1": {
+      "input": "s = \"\"",
+      "output": "0"
+    },
+    "test_2": {
+      "input": "s = \" \",  # single space",
+      "output": "1"
+    }
+  }
+}
