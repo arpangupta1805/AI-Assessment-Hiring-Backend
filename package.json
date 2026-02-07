@@ -15,7 +15,6 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@google/generative-ai": "^0.24.1",
     "axios": "^1.4.0",
     "bcryptjs": "^3.0.2",
     "cors": "^2.8.5",
@@ -26,6 +25,8 @@
     "mongoose": "^8.0.0",
     "multer": "^2.0.2",
     "nodemailer": "^8.0.0",
+    "openai": "^6.18.0",
+    "pdf-parse": "^1.1.1",
     "svix": "^1.15.0"
   },
   "devDependencies": {

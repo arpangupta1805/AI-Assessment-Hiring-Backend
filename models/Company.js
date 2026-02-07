@@ -40,7 +40,8 @@ const CompanySchema = new mongoose.Schema(
     }
 );
 
-CompanySchema.index({ email: 1 });
+// Redundant with unique: true in field definition
+// CompanySchema.index({ email: 1 });
 CompanySchema.index({ name: 1 });
 
 const Company = mongoose.model('Company', CompanySchema);

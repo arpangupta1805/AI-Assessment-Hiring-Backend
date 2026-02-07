@@ -3,6 +3,7 @@ import { body, validationResult } from 'express-validator';
 import EmailTemplate from '../models/EmailTemplate.js';
 import CandidateAssessment from '../models/CandidateAssessment.js';
 import Evaluation from '../models/Evaluation.js';
+import ProctoringEvent from '../models/ProctoringEvent.js';
 import User from '../models/User.js';
 import { authenticateToken, requireRecruiter } from '../middleware/auth.js';
 import emailService from '../services/emailService.js';
@@ -106,7 +107,7 @@ router.post('/send-result/:candidateAssessmentId', authenticateToken, requireRec
         }
 
         const { candidateAssessmentId } = req.params;
-        const { resultType, customMessage } = req.body;
+        const { resultType, customMessage, selectedProctoringEvents, includeReport } = req.body;
 
         const candidateAssessment = await CandidateAssessment.findById(candidateAssessmentId)
             .populate('candidate', 'name email')
@@ -130,6 +131,67 @@ router.post('/send-result/:candidateAssessmentId', authenticateToken, requireRec
             });
         }
 
+        // --- Fetch Additional Data ---
+        let reportHtml = '';
+
+        // 1. Evaluation Report
+        if (includeReport) {
+            const evaluation = await Evaluation.findOne({ candidateAssessment: candidateAssessment._id });
+            if (evaluation) {
+                reportHtml += `
+                    <div style="margin-top: 20px; border-top: 1px solid #ddd; padding-top: 20px;">
+                        <h3 style="color: #333;">Assessment Result Summary</h3>
+                        <p><strong>Total Score:</strong> ${evaluation.percentage.toFixed(1)}%</p>
+                        <table style="width: 100%; border-collapse: collapse; margin-bottom: 15px;">
+                            <tr style="background-color: #f9f9f9; text-align: left;">
+                                <th style="padding: 8px; border: 1px solid #ddd;">Section</th>
+                                <th style="padding: 8px; border: 1px solid #ddd;">Score</th>
+                            </tr>
+                            <tr>
+                                <td style="padding: 8px; border: 1px solid #ddd;">Objective</td>
+                                <td style="padding: 8px; border: 1px solid #ddd;">${evaluation.sections.objective.percentage.toFixed(1)}%</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 8px; border: 1px solid #ddd;">Subjective (AI)</td>
+                                <td style="padding: 8px; border: 1px solid #ddd;">${evaluation.sections.subjective.percentage.toFixed(1)}%</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 8px; border: 1px solid #ddd;">Programming</td>
+                                <td style="padding: 8px; border: 1px solid #ddd;">${evaluation.sections.programming.percentage.toFixed(1)}%</td>
+                            </tr>
+                        </table>
+                        
+                        ${evaluation.recommendation ? `
+                        <div style="background-color: #f0f7ff; padding: 10px; border-left: 4px solid #0066cc; margin-bottom: 15px;">
+                            <strong>AI Recommendation:</strong> ${evaluation.recommendation.action}
+                            <p style="margin: 5px 0 0 0; font-size: 0.9em;">${evaluation.recommendation.reason}</p>
+                        </div>` : ''}
+                    </div>
+                `;
+            }
+        }
+
+        // 2. Proctoring Events
+        if (selectedProctoringEvents && selectedProctoringEvents.length > 0) {
+            const events = await ProctoringEvent.find({ _id: { $in: selectedProctoringEvents } });
+
+            if (events.length > 0) {
+                reportHtml += `
+                    <div style="margin-top: 20px; border-top: 1px solid #ddd; padding-top: 20px;">
+                        <h3 style="color: #d32f2f;">Proctoring Flags</h3>
+                        <p>The following irregularities were noted during the assessment:</p>
+                        <ul style="color: #d32f2f;">
+                `;
+
+                events.forEach(event => {
+                    const cleanType = event.eventType.replace(/_/g, ' ').toUpperCase();
+                    reportHtml += `<li><strong>${cleanType}:</strong> ${event.evidence?.aiAnalysis?.briefReason || event.description || 'Detected via proctoring system'}</li>`;
+                });
+
+                reportHtml += `</ul></div>`;
+            }
+        }
+
         // Get template
         const templateType = resultType === 'pass' ? 'result_pass' : 'result_fail';
         const template = await EmailTemplate.getTemplate(req.user.company, templateType);
@@ -142,17 +204,24 @@ router.post('/send-result/:candidateAssessmentId', authenticateToken, requireRec
         }
 
         // Render template
-        const { subject, body } = template.render({
+        // We inject reportHtml into {{assessmentReport}} placeholder if it exists, or append it
+        let { subject, body } = template.render({
             candidateName: candidateAssessment.candidate.name,
             roleTitle: candidateAssessment.jd.parsedContent?.roleTitle || 'Position',
             companyName: candidateAssessment.jd.company.name,
+            assessmentReport: reportHtml, // Inject report
         });
+
+        // If template doesn't have {{assessmentReport}}, append it to body if reportHtml is not empty
+        if (reportHtml && !body.includes(reportHtml) && !template.body.includes('{{assessmentReport}}')) {
+            body += reportHtml;
+        }
 
         // Send email
         await emailService.sendEmail(
             candidateAssessment.candidate.email,
             subject,
-            customMessage ? customMessage : body
+            customMessage ? (customMessage + reportHtml) : body
         );
 
         // Update candidate assessment

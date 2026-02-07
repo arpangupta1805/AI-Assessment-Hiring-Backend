@@ -1,6 +1,6 @@
 import express from 'express';
 import { body, validationResult } from 'express-validator';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { callOpenAI } from '../lib/openai.js';
 import JobDescription from '../models/JobDescription.js';
 import CandidateAssessment from '../models/CandidateAssessment.js';
 import AssessmentSet from '../models/AssessmentSet.js';
@@ -8,12 +8,12 @@ import User from '../models/User.js';
 import OTP from '../models/OTP.js';
 import { authenticateToken, optionalAuth } from '../middleware/auth.js';
 import { uploadResume, saveBase64Image, extractResumeText } from '../services/uploadService.js';
+import emailService from '../services/emailService.js';
 
 const router = express.Router();
 
-// Initialize Gemini AI
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-2.0-flash' });
+// OpenAI initialized in lib/openai.js
+
 
 // ============================================================================
 // PUBLIC ROUTES (Assessment Link Access)
@@ -146,30 +146,37 @@ router.post('/register/:link', [
             jd: jd._id,
         });
 
-        if (candidateAssessment) {
-            // Check attempt limits
-            if (candidateAssessment.attemptNumber >= jd.assessmentConfig.maxAttempts) {
-                return res.status(400).json({
-                    success: false,
-                    error: 'Maximum attempts reached',
-                });
-            }
-        } else {
-            // Create new candidate assessment
-            candidateAssessment = await CandidateAssessment.create({
-                candidate: user._id,
-                jd: jd._id,
-                assessmentLink: link,
-                status: 'onboarding',
-            });
 
-            // Increment JD candidate count
-            jd.stats.totalCandidates += 1;
-            await jd.save();
-        }
+        // Create new candidate assessment
+        candidateAssessment = await CandidateAssessment.create({
+            candidate: user._id,
+            jd: jd._id,
+            assessmentLink: link,
+            status: 'onboarding',
+        });
+
+        // Increment JD candidate count
+        jd.stats.totalCandidates += 1;
+        await jd.save();
 
         // Send OTP for email verification
         const { otp, expiresAt } = await OTP.createOTP(email, 'email_verification');
+
+        // Actually send the email
+        try {
+            await emailService.sendOTP(email, otp);
+            console.log(`📧 OTP sent to ${email}`);
+        } catch (emailError) {
+            console.error('❌ Failed to send OTP email:', emailError);
+            // In dev mode we can still proceed as OTP is logged
+            if (process.env.NODE_ENV !== 'development') {
+                return res.status(500).json({
+                    success: false,
+                    error: 'Failed to send verification email',
+                });
+            }
+        }
+
         console.log(`📧 OTP for ${email}: ${otp}`);
 
         res.status(201).json({
@@ -394,40 +401,40 @@ router.post('/upload-resume/:candidateAssessmentId',
             }
 
             // Check if file was uploaded
-            if (!req.file && !resumeText) {
+            if (!req.file) {
                 return res.status(400).json({
                     success: false,
-                    error: 'Resume file or text is required',
+                    error: 'Resume file is required',
                 });
             }
 
             // Save resume info
-            if (req.file) {
-                candidateAssessment.resume.fileUrl = `/uploads/resumes/${req.file.filename}`;
-                candidateAssessment.resume.fileName = req.file.originalname;
+            candidateAssessment.resume.fileUrl = `/uploads/resumes/${req.file.filename}`;
+            candidateAssessment.resume.fileName = req.file.originalname;
 
-                // Try to extract text (only works for .txt files without additional libs)
-                const extractedText = await extractResumeText(candidateAssessment.resume.fileUrl);
-                candidateAssessment.resume.parsedText = resumeText || extractedText || '';
-            } else {
-                candidateAssessment.resume.parsedText = resumeText || '';
+            // Extract text from the uploaded file
+            const extractedText = await extractResumeText(candidateAssessment.resume.fileUrl);
+
+            if (!extractedText) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'Could not extract text from your resume. Please ensure it is a valid PDF or Word document.'
+                });
             }
 
+            candidateAssessment.resume.parsedText = extractedText;
             candidateAssessment.status = 'resume_review';
             await candidateAssessment.save();
 
-            // Trigger resume matching (async)
-            matchResumeWithJD(candidateAssessmentId).catch(err => {
-                console.error('❌ Background resume matching error:', err);
-            });
+            // Wait for resume matching (Sync Flow)
+            const updatedAssessment = await matchResumeWithJD(candidateAssessmentId);
 
             res.json({
                 success: true,
-                message: 'Resume uploaded. Analyzing...',
+                message: 'Resume analyzed successfully',
                 data: {
-                    status: 'resume_review',
-                    fileUrl: candidateAssessment.resume.fileUrl,
-                    fileName: candidateAssessment.resume.fileName,
+                    status: updatedAssessment?.status || 'resume_review',
+                    resume: updatedAssessment?.resume,
                 },
             });
         } catch (error) {
@@ -510,6 +517,7 @@ router.get('/status/:candidateAssessmentId', async (req, res) => {
                 assignedSet: candidateAssessment.assignedSet ? candidateAssessment.assignedSetNumber : null,
                 roleTitle: candidateAssessment.jd?.parsedContent?.roleTitle,
                 totalTimeMinutes: candidateAssessment.jd?.assessmentConfig?.totalTimeMinutes,
+                sections: candidateAssessment.jd?.assessmentConfig?.sections,
                 canStart: candidateAssessment.isOnboardingComplete(),
             },
         });
@@ -554,12 +562,18 @@ router.post('/start/:candidateAssessmentId', async (req, res) => {
             });
         }
 
-        // Check if already started
+        // Check if already started - return existing session token
         if (candidateAssessment.status === 'in_progress' || candidateAssessment.startedAt) {
-            return res.status(400).json({
-                success: false,
-                error: 'Assessment already started',
-                sessionToken: candidateAssessment.sessionToken,
+            return res.json({
+                success: true,
+                message: 'Assessment already in progress',
+                data: {
+                    sessionToken: candidateAssessment.sessionToken,
+                    startedAt: candidateAssessment.startedAt,
+                    totalTimeMinutes: candidateAssessment.jd.assessmentConfig.totalTimeMinutes,
+                    currentSection: candidateAssessment.currentSection,
+                    sections: candidateAssessment.jd.assessmentConfig.sections,
+                },
             });
         }
 
@@ -633,7 +647,7 @@ async function matchResumeWithJD(candidateAssessmentId) {
 
         if (!candidateAssessment) {
             console.error('❌ CandidateAssessment not found:', candidateAssessmentId);
-            return;
+            return null;
         }
 
         const jd = candidateAssessment.jd;
@@ -641,49 +655,63 @@ async function matchResumeWithJD(candidateAssessmentId) {
 
         if (!resumeText) {
             console.error('❌ No resume text to match');
-            return;
+            return candidateAssessment;
         }
 
-        const prompt = `You are an expert HR analyst. Analyze the following resume against the job description.
+        const prompt = `You are an expert technical recruiter specializing in identifying high-potential talent. Your task is to perform an in-depth scoring of the following Resume against the Job Description (JD).
 
+### SCORING RUBRIC (Total 100 points)
+1. **Applied Technical Skills (40 points)**: 
+   - **Crucial**: Do NOT solely rely on the "Skills" header. Analyze the projects and work experience to find evidence of skill application.
+   - **Evidence in Projects/Work**: High weight. Look for specific libraries, frameworks, and architecture patterns mentioned in project descriptions.
+   - **Matched Skills**: Compare the found skills against the ${jd.parsedContent?.technicalSkills?.length || 0} required skills in the JD.
+
+2. **Project Complexity & Innovation (40 points)**:
+   - Evaluate the scale, depth, and technical challenge of the candidate's projects.
+   - Real-world deployments, integration of multiple technologies (e.g., AI + WebSockets + DB), and complex problem-solving score highly.
+   - For students/freshers, high-quality projects are the primary indicator of capability.
+
+3. **Experience & Contextual Fit (20 points)**:
+   - **Important**: If the JD accepts candidates who are "pursuing" a degree or are "freshers", treat high-quality, long-term projects as professional-grade experience.
+   - Assess the years of experience relative to the requirement (${jd.parsedContent?.yearsOfExperience?.min || 0} years).
+
+### INPUT DATA
 JOB DESCRIPTION:
 Role: ${jd.parsedContent?.roleTitle || 'Not specified'}
 Required Skills: ${jd.parsedContent?.technicalSkills?.map(s => s.name).join(', ') || 'Not specified'}
-Experience Level: ${jd.parsedContent?.experienceLevel || 'Not specified'}
-Years Required: ${jd.parsedContent?.yearsOfExperience?.min || 0} - ${jd.parsedContent?.yearsOfExperience?.max || 0}
+Experience Level: ${jd.parsedContent?.experienceLevel || 'fresher'}
+Target Years: ${jd.parsedContent?.yearsOfExperience?.min || 0} - ${jd.parsedContent?.yearsOfExperience?.max || 0}
 
-RESUME:
-${resumeText.substring(0, 3000)}
+RESUME TEXT:
+${resumeText.substring(0, 4000)}
 
-Analyze and return JSON:
+### EXECUTION RULES:
+- **Be Fair to Potential**: If a candidate shows exceptional technical depth in projects that match the company's tech stack (React, Node, AI), score them highly even if they are still students.
+- **Evidence-Based**: Award points based on *what they built* and *how they built it*.
+- **Consistency**: Maintain a logical point distribution.
+- **Tone**: Professional, analytical, and fair.
+
+### OUTPUT FORMAT (JSON ONLY)
 {
-  "matchScore": 0-100,
+  "matchScore": number (0-100),
+  "scoreJustification": "DETAILED breakdown: [Skills: X/40, Projects: X/40, Fit: X/20]. Explain why points were given/withheld.",
   "skillMatches": [
-    {"skill": "skill name", "matched": true/false, "confidence": 0-100}
+    {"skill": "string", "matched": boolean, "confidence": 0-100, "evidenceFoundInProjects": boolean}
   ],
-  "experienceMatch": true/false,
-  "qualificationMatch": true/false,
-  "isFake": true/false,
-  "fakeReasons": ["reason if fake"],
-  "overallAnalysis": "Brief analysis of the match"
+  "experienceMatch": boolean,
+  "qualificationMatch": boolean,
+  "isFake": boolean,
+  "fakeReasons": ["string"],
+  "overallAnalysis": "Focus on technical depth and project implementation quality."
 }
-
-IMPORTANT:
-- Be strict but fair in matching
-- Check for inconsistencies that might indicate a fake resume
-- Consider relevant experience even if not exact match
-- Score above 90 only if excellent match
 
 Return ONLY valid JSON.`;
 
         try {
-            const result = await model.generateContent(prompt);
-            let response = result.response.text();
-            response = response.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-            const analysis = JSON.parse(response);
+            const analysis = await callOpenAI(prompt, process.env.OPENAI_MODEL || 'gpt-4o', true, 3, 0.1);
 
-            // Get threshold from JD
-            const threshold = jd.assessmentConfig?.resumeMatchThreshold || 90;
+            // Get threshold from JD (Update default to 70 in logic too)
+            const threshold = jd.assessmentConfig?.resumeMatchThreshold || 70;
 
             // Update candidate assessment
             candidateAssessment.resume.matchScore = analysis.matchScore || 0;
@@ -705,8 +733,8 @@ Return ONLY valid JSON.`;
             }
 
             await candidateAssessment.save();
-
-            console.log(`✅ Resume matched for ${candidateAssessmentId}: score=${analysis.matchScore}, passed=${candidateAssessment.resume.passedThreshold}`);
+            console.log(`✅ Resume matched for ${candidateAssessmentId}: score = ${analysis.matchScore}, passed = ${candidateAssessment.resume.passedThreshold} `);
+            return candidateAssessment;
 
         } catch (parseError) {
             console.error('❌ Error parsing AI response:', parseError);
@@ -714,11 +742,204 @@ Return ONLY valid JSON.`;
             candidateAssessment.resume.matchScore = 0;
             candidateAssessment.status = 'resume_rejected';
             await candidateAssessment.save();
+            return candidateAssessment;
         }
 
     } catch (error) {
         console.error('❌ Resume matching error:', error);
+        return null;
     }
 }
 
+// ============================================================================
+// CANDIDATE PROFILE & HISTORY (Authenticated)
+// ============================================================================
+
+/**
+ * GET /api/candidate/profile
+ * Get candidate's own profile
+ */
+router.get('/profile', authenticateToken, async (req, res) => {
+    try {
+        if (req.user.role !== 'candidate') {
+            return res.status(403).json({ success: false, error: 'Access denied' });
+        }
+
+        const user = await User.findById(req.user._id).select('-password');
+
+        res.json({
+            success: true,
+            data: {
+                id: user._id,
+                email: user.email,
+                username: user.username,
+                name: user.name,
+                role: user.role,
+                profileImageUrl: user.profileImageUrl,
+            },
+        });
+    } catch (error) {
+        console.error('❌ Get candidate profile error:', error);
+        res.status(500).json({ success: false, error: 'Failed to get profile' });
+    }
+});
+
+/**
+ * PUT /api/candidate/profile
+ * Update candidate's own profile
+ */
+router.put('/profile', authenticateToken, [
+    body('username').optional().trim().isLength({ min: 3, max: 20 }).matches(/^[a-zA-Z0-9_]+$/).withMessage('Username must be 3-20 characters with letters, numbers, and underscores'),
+    body('name').optional().trim().notEmpty().withMessage('Name cannot be empty'),
+], async (req, res) => {
+    try {
+        if (req.user.role !== 'candidate') {
+            return res.status(403).json({ success: false, error: 'Access denied' });
+        }
+
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({ success: false, errors: errors.array() });
+        }
+
+        const { name, username } = req.body;
+        const user = await User.findById(req.user._id);
+
+        if (name) user.name = name;
+
+        if (username) {
+            const existingUser = await User.findOne({ username, _id: { $ne: user._id } });
+            if (existingUser) {
+                return res.status(400).json({ success: false, error: 'Username already taken' });
+            }
+            user.username = username;
+        }
+
+        await user.save();
+
+        res.json({
+            success: true,
+            message: 'Profile updated successfully',
+            data: {
+                id: user._id,
+                email: user.email,
+                username: user.username,
+                name: user.name,
+            },
+        });
+    } catch (error) {
+        console.error('❌ Update candidate profile error:', error);
+        res.status(500).json({ success: false, error: 'Failed to update profile' });
+    }
+});
+
+/**
+ * GET /api/candidate/history
+ * Get candidate's assessment history
+ */
+router.get('/history', authenticateToken, async (req, res) => {
+    try {
+        if (req.user.role !== 'candidate') {
+            return res.status(403).json({ success: false, error: 'Access denied' });
+        }
+
+        const assessments = await CandidateAssessment.find({
+            candidate: req.user._id,
+        })
+            .populate({
+                path: 'jd',
+                populate: { path: 'company', select: 'name' },
+                select: 'parsedContent company',
+            })
+            .select('status evaluation adminDecision resultReleasedAt submittedAt totalScore sectionScores')
+            .sort({ submittedAt: -1 });
+
+        const history = assessments.map((a) => ({
+            _id: a._id,
+            companyName: a.jd?.company?.name || 'Company',
+            roleTitle: a.jd?.parsedContent?.roleTitle || 'Position',
+            submittedAt: a.submittedAt,
+            status: a.status,
+            adminDecision: a.adminDecision,
+            resultReleased: !!a.resultReleasedAt,
+            // Only include scores if result is released
+            ...(a.resultReleasedAt && {
+                totalScore: a.evaluation?.totalScore || a.totalScore,
+                sectionScores: a.evaluation?.sectionScores || a.sectionScores,
+                showDetails: true,
+            }),
+        }));
+
+        res.json({
+            success: true,
+            data: history,
+        });
+    } catch (error) {
+        console.error('❌ Get candidate history error:', error);
+        res.status(500).json({ success: false, error: 'Failed to get assessment history' });
+    }
+});
+
+/**
+ * GET /api/candidate/history/:assessmentId
+ * Get details of a specific assessment (only if result released)
+ */
+router.get('/history/:assessmentId', authenticateToken, async (req, res) => {
+    try {
+        if (req.user.role !== 'candidate') {
+            return res.status(403).json({ success: false, error: 'Access denied' });
+        }
+
+        const assessment = await CandidateAssessment.findOne({
+            _id: req.params.assessmentId,
+            candidate: req.user._id,
+        })
+            .populate({
+                path: 'jd',
+                populate: { path: 'company', select: 'name' },
+                select: 'parsedContent company',
+            });
+
+        if (!assessment) {
+            return res.status(404).json({ success: false, error: 'Assessment not found' });
+        }
+
+        // Check if result is released
+        if (!assessment.resultReleasedAt) {
+            return res.json({
+                success: true,
+                data: {
+                    _id: assessment._id,
+                    companyName: assessment.jd?.company?.name || 'Company',
+                    roleTitle: assessment.jd?.parsedContent?.roleTitle || 'Position',
+                    submittedAt: assessment.submittedAt,
+                    status: 'pending_review',
+                    resultReleased: false,
+                },
+            });
+        }
+
+        // Return full details
+        res.json({
+            success: true,
+            data: {
+                _id: assessment._id,
+                companyName: assessment.jd?.company?.name || 'Company',
+                roleTitle: assessment.jd?.parsedContent?.roleTitle || 'Position',
+                submittedAt: assessment.submittedAt,
+                status: assessment.status,
+                adminDecision: assessment.adminDecision,
+                resultReleased: true,
+                evaluation: assessment.evaluation,
+                totalScore: assessment.evaluation?.totalScore,
+                sectionScores: assessment.evaluation?.sectionScores,
+            },
+        });
+    } catch (error) {
+        console.error('❌ Get assessment detail error:', error);
+        res.status(500).json({ success: false, error: 'Failed to get assessment details' });
+    }
+});
+
 export default router;
+

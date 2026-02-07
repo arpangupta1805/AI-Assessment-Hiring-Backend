@@ -4,6 +4,7 @@ import CandidateAssessment from '../models/CandidateAssessment.js';
 import AssessmentSet from '../models/AssessmentSet.js';
 import AssessmentAnswer from '../models/AssessmentAnswer.js';
 import ProctoringEvent from '../models/ProctoringEvent.js';
+import { runEvaluation } from './evaluation.js';
 
 const router = express.Router();
 
@@ -447,17 +448,23 @@ router.post('/submit-all', validateSession, async (req, res) => {
             (Date.now() - candidateAssessment.startedAt.getTime()) / 1000
         );
 
+        // Update candidate assessment
         candidateAssessment.status = 'submitted';
         candidateAssessment.submittedAt = new Date();
         candidateAssessment.timeSpentSeconds = timeSpentSeconds;
         candidateAssessment.currentSection = null;
         await candidateAssessment.save();
 
-        // Update JD stats
-        const JobDescription = (await import('../models/JobDescription.js')).default;
-        await JobDescription.findByIdAndUpdate(candidateAssessment.jd._id, {
-            $inc: { 'stats.completedAssessments': 1 },
-        });
+        // Create synchronous evaluation
+        // User wants to wait for the report to be generated before seeing the success page
+        console.log(`⏳ Starting synchronous evaluation for ${candidateAssessment._id}...`);
+        try {
+            await runEvaluation(candidateAssessment._id);
+            console.log(`✅ Synchronous evaluation complete for ${candidateAssessment._id}`);
+        } catch (evalErr) {
+            console.error('❌ Synchronous evaluation failed (submission still successful):', evalErr);
+            // We don't fail the request, just log it. The user has submitted successfully.
+        }
 
         res.json({
             success: true,
@@ -466,6 +473,12 @@ router.post('/submit-all', validateSession, async (req, res) => {
                 submittedAt: candidateAssessment.submittedAt,
                 timeSpentSeconds,
             },
+        });
+
+        // Update JD stats
+        const JobDescription = (await import('../models/JobDescription.js')).default;
+        await JobDescription.findByIdAndUpdate(candidateAssessment.jd._id, {
+            $inc: { 'stats.completedAssessments': 1 },
         });
     } catch (error) {
         console.error('❌ Submit all error:', error);
@@ -503,7 +516,9 @@ router.post('/proctoring/event', validateSession, [
         'tab_switch', 'window_blur', 'multiple_faces', 'no_face', 'face_not_centered',
         'device_detected', 'external_screen', 'copy_paste', 'right_click',
         'keyboard_shortcut', 'idle', 'suspicious_behavior', 'browser_resize',
-        'fullscreen_exit', 'dev_tools',
+        'fullscreen_exit', 'dev_tools', 'camera_denied', 'fullscreen_failed',
+        'copy_attempt', 'paste_attempt', 'cut_attempt', 'assessment_completed',
+        'periodic_check',
     ]).withMessage('Invalid event type'),
 ], async (req, res) => {
     try {

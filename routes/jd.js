@@ -1,22 +1,21 @@
 import express from 'express';
 import { body, validationResult, param } from 'express-validator';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { callOpenAI } from '../lib/openai.js';
 import JobDescription from '../models/JobDescription.js';
 import AssessmentSet from '../models/AssessmentSet.js';
 import { authenticateToken, requireRecruiter } from '../middleware/auth.js';
 
 const router = express.Router();
 
-// Initialize Gemini AI
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-2.0-flash' });
+// OpenAI client initialized in lib/openai.js
+
 
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
 
 /**
- * Parse JD text using Gemini AI
+ * Parse JD text using OpenAI
  */
 async function parseJDWithAI(jdText) {
   const prompt = `You are an expert HR analyst. Analyze the following job description and extract structured information.
@@ -26,50 +25,48 @@ ${jdText}
 
 Return a JSON object with the following structure:
 {
-  "refinedJD": "A cleaned, well-formatted version of the JD (max 500 words)",
-  "aboutCompany": "2-3 sentences about the company",
-  "roleTitle": "The job title",
-  "roleResponsibilities": ["Array of key responsibilities"],
+  "refinedJD": "A cleaned, well-formatted version of the JD (max 500 words). Maintain professional tone.",
+  "companyName": "Exact name of the hiring company (or 'Confidential' if not mentioned)",
+  "aboutCompany": "2-3 sentences about the company, culture, and mission.",
+  "roleTitle": "The specific job title (e.g., 'Senior Frontend Engineer')",
+  "roleResponsibilities": [
+    "3-5 short, actionable responsibilities (e.g., 'Build responsive UI components', 'Optimize API performance')"
+  ],
   "experienceLevel": "One of: fresher, junior, mid, senior, lead, executive",
   "yearsOfExperience": {"min": number, "max": number},
   "technicalSkills": [
     {
-      "name": "Skill name",
-      "weight": 1-10 (importance),
+      "name": "Skill name (e.g., React, Node.js)",
+      "category": "One of: Frontend, Backend, Database, DevOps, Mobile, Tools, Core, Other",
+      "weight": 1-10 (importance for the role),
       "difficulty": "basic/intermediate/advanced",
-      "isPrimary": true/false
+      "isPrimary": true/false (true = Must Have/Core, false = Good to Have/Optional)
     }
   ],
   "softSkills": [
     {
-      "name": "Skill name",
-      "weight": 1-10
+      "name": "Skill name (e.g., Problem Solving, Communication)",
+      "weight": 1-10 (focus on logical reasoning and adaptability)
     }
   ],
-  "toolsAndTechnologies": ["Array of tools/technologies mentioned"],
-  "qualifications": ["Array of required qualifications"],
-  "evaluationRubrics": "Suggested evaluation criteria for assessing candidates"
+  "toolsAndTechnologies": ["Array of specific tools mentioned (e.g., Jira, AWS, Docker)"],
+  "qualifications": ["Array of required degrees or certifications"],
+  "suggestedDifficulty": "basic/intermediate/advanced",
+  "evaluationRubrics": "Markdown formatted evaluation criteria for assessing candidates."
 }
 
-IMPORTANT:
-- Extract at least 5-10 technical skills
-- Assign weights based on how frequently/prominently they are mentioned
-- Mark skills that are "must have" as isPrimary: true
-- Be thorough in extracting responsibilities
+IMPORTANT GUIDELINES:
+1. **Skill Categorization**: Group skills logically (e.g., HTML/CSS -> Frontend, Python/Node -> Backend).
+2. **Tech Stack Breadth**: For 'fresher' or 'junior' roles, DO NOT mark too many advanced skills as 'isPrimary'. Focus on Core skills.
+   - Example: For a Junior Dev, HTML/CSS/JS are Primary. Docker/Kubernetes are likely optional.
+3. **Responsibilities**: Extract clear, actionable tasks, not just generic statements.
+4. **Soft Skills**: Focus on evaluable traits like 'Analytical Thinking', 'Debug Strategy', rather than generic 'Hard working'.
+5. **Accuracy**: Ensure extracted years of experience matches the text exactly.
 
-Return ONLY valid JSON, no markdown or explanation.`;
+Return ONLY valid JSON, no markdown.`;
 
   try {
-    const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
-
-    // Clean the response - remove markdown code blocks if present
-    let cleanedResponse = responseText
-      .replace(/```json\n?/g, '')
-      .replace(/```\n?/g, '')
-      .trim();
-
-    const parsed = JSON.parse(cleanedResponse);
+    const parsed = await callOpenAI(prompt, process.env.OPENAI_MODEL || 'gpt-4o', true);
     return { success: true, data: parsed };
   } catch (error) {
     console.error('❌ AI parsing error:', error);
@@ -156,7 +153,7 @@ router.get('/:id', authenticateToken, requireRecruiter, async (req, res) => {
     const jd = await JobDescription.findOne({
       _id: req.params.id,
       company: req.user.company,
-    }).populate('assessmentSets');
+    }).populate('assessmentSets').populate('company');
 
     if (!jd) {
       return res.status(404).json({
@@ -249,6 +246,22 @@ router.post('/:id/parse', authenticateToken, requireRecruiter, async (req, res) 
       });
     }
 
+    // Idempotency check: If already parsed, return existing result
+    if (jd.status === 'parsed' && jd.parsedContent && jd.parsedContent.experienceLevel) {
+      console.log('✅ JD already parsed, returning existing result:', jd._id);
+      return res.json({
+        success: true,
+        message: 'JD already parsed',
+        data: {
+          id: jd._id,
+          status: jd.status,
+          parsedContent: jd.parsedContent,
+          evaluationRubrics: jd.evaluationRubrics,
+          assessmentConfig: jd.assessmentConfig,
+        },
+      });
+    }
+
     if (!jd.rawText && !jd.rawFileUrl) {
       return res.status(400).json({
         success: false,
@@ -278,7 +291,7 @@ router.post('/:id/parse', authenticateToken, requireRecruiter, async (req, res) 
       jd.parsingMeta = {
         parsedAt: new Date(),
         parseErrors: [parseResult.error],
-        aiModel: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+        aiModel: process.env.OPENAI_MODEL || 'gpt-4o',
       };
       await jd.save();
 
@@ -292,6 +305,7 @@ router.post('/:id/parse', authenticateToken, requireRecruiter, async (req, res) 
     // Update JD with parsed content
     jd.parsedContent = {
       refinedJD: parseResult.data.refinedJD || '',
+      companyName: parseResult.data.companyName || '',
       aboutCompany: parseResult.data.aboutCompany || '',
       roleTitle: parseResult.data.roleTitle || '',
       roleResponsibilities: parseResult.data.roleResponsibilities || [],
@@ -314,7 +328,7 @@ router.post('/:id/parse', authenticateToken, requireRecruiter, async (req, res) 
     jd.parsingMeta = {
       parsedAt: new Date(),
       parseErrors: [],
-      aiModel: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+      aiModel: process.env.OPENAI_MODEL || 'gpt-4o',
     };
 
     await jd.save();
@@ -359,13 +373,6 @@ router.put('/:id/config', authenticateToken, requireRecruiter, async (req, res) 
       });
     }
 
-    if (jd.assessmentConfig.isLocked) {
-      return res.status(400).json({
-        success: false,
-        error: 'Assessment is locked and cannot be modified',
-      });
-    }
-
     const {
       cutoffScore,
       resumeMatchThreshold,
@@ -375,7 +382,24 @@ router.put('/:id/config', authenticateToken, requireRecruiter, async (req, res) 
       endTime,
       maxAttempts,
       instructions,
+      difficultyDistribution,
     } = req.body;
+
+    // Check if test has already started (Lock logic)
+    const now = new Date();
+    const testStarted = jd.assessmentConfig.startTime && now >= new Date(jd.assessmentConfig.startTime);
+
+    // If test started, only allow updating endTime
+    if (testStarted) {
+      if (cutoffScore !== undefined || resumeMatchThreshold !== undefined || sections !== undefined ||
+        numberOfSets !== undefined || startTime !== undefined || maxAttempts !== undefined ||
+        instructions !== undefined || difficultyDistribution !== undefined) {
+        return res.status(400).json({
+          success: false,
+          error: 'Assessment has already started. Only End Time can be modified now.',
+        });
+      }
+    }
 
     // Update config fields if provided
     if (cutoffScore !== undefined) jd.assessmentConfig.cutoffScore = cutoffScore;
@@ -391,6 +415,12 @@ router.put('/:id/config', authenticateToken, requireRecruiter, async (req, res) 
     if (endTime !== undefined) jd.assessmentConfig.endTime = endTime;
     if (maxAttempts !== undefined) jd.assessmentConfig.maxAttempts = maxAttempts;
     if (instructions !== undefined) jd.assessmentConfig.instructions = instructions;
+    if (difficultyDistribution !== undefined) {
+      jd.assessmentConfig.difficultyDistribution = {
+        ...jd.assessmentConfig.difficultyDistribution,
+        ...difficultyDistribution,
+      };
+    }
 
     // Recalculate total time
     jd.assessmentConfig.totalTimeMinutes = jd.calculateTotalTime();
@@ -431,10 +461,12 @@ router.put('/:id/skills', authenticateToken, requireRecruiter, async (req, res) 
       });
     }
 
-    if (jd.assessmentConfig.isLocked) {
+    // Check if test has already started
+    const now = new Date();
+    if (jd.assessmentConfig.startTime && now >= new Date(jd.assessmentConfig.startTime)) {
       return res.status(400).json({
         success: false,
-        error: 'Assessment is locked and cannot be modified',
+        error: 'Assessment has already started and skills cannot be modified',
       });
     }
 
@@ -525,6 +557,15 @@ router.put('/:id/rubrics', authenticateToken, requireRecruiter, [
       });
     }
 
+    // Check if test has already started
+    const now = new Date();
+    if (jd.assessmentConfig.startTime && now >= new Date(jd.assessmentConfig.startTime)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Assessment has already started and rubrics cannot be modified',
+      });
+    }
+
     jd.evaluationRubrics = req.body.evaluationRubrics;
     await jd.save();
 
@@ -588,6 +629,56 @@ router.put('/:id/lock', authenticateToken, requireRecruiter, async (req, res) =>
 });
 
 /**
+ * POST /api/jd/:id/generate-questions
+ * Generate question sets without creating a link yet
+ */
+router.post('/:id/generate-questions', authenticateToken, requireRecruiter, async (req, res) => {
+  try {
+    const jd = await JobDescription.findOne({
+      _id: req.params.id,
+      company: req.user.company,
+    });
+
+    if (!jd) {
+      return res.status(404).json({
+        success: false,
+        error: 'Job description not found',
+      });
+    }
+
+    // Update config if provided
+    if (req.body.numberOfSets) {
+      await JobDescription.findByIdAndUpdate(req.params.id, {
+        $set: { 'assessmentConfig.numberOfSets': req.body.numberOfSets }
+      });
+    }
+
+    // Trigger set generation and wait
+    const result = await generateQuestionSets(req.params.id);
+
+    if (!result.success) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to generate question sets',
+        details: result.error
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Question sets generated successfully',
+      data: { sets: result.sets }
+    });
+  } catch (error) {
+    console.error('❌ Generate questions error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to start question generation',
+    });
+  }
+});
+
+/**
  * POST /api/jd/:id/generate-link
  * Generate unique assessment link
  * This also triggers question set generation
@@ -642,33 +733,39 @@ router.post('/:id/generate-link', authenticateToken, requireRecruiter, async (re
     }
 
     // Update JD
-    jd.assessmentConfig.assessmentLink = assessmentLink;
-    jd.assessmentConfig.linkGeneratedAt = new Date();
-    jd.assessmentConfig.startTime = start;
-    jd.assessmentConfig.endTime = end;
-    jd.assessmentConfig.isLocked = true;
-    jd.assessmentConfig.lockedAt = new Date();
-    jd.status = 'generating_sets';
+    const updateData = {
+      'assessmentConfig.assessmentLink': assessmentLink,
+      'assessmentConfig.linkGeneratedAt': new Date(),
+      'assessmentConfig.startTime': start,
+      'assessmentConfig.endTime': end,
+      // Removed automatic isLocked = true to allow edits until startTime
+      status: 'generating_sets'
+    };
 
-    await jd.save();
+    await JobDescription.findByIdAndUpdate(jd._id, { $set: updateData });
 
-    // Return immediately - set generation will happen in background
-    // In production, this would be handled by a queue/worker
+    // Trigger set generation and MAINTAIN sequence (Wait for success)
+    console.log(`⏳ Starting question generation for JD ${jd._id} before returning link...`);
+    const generationResult = await generateQuestionSets(jd._id);
+
+    if (!generationResult.success) {
+      return res.status(500).json({
+        success: false,
+        error: 'Assessment link generated, but question set generation failed.',
+        details: generationResult.error
+      });
+    }
+
     res.json({
       success: true,
-      message: 'Assessment link generated. Question sets are being generated.',
+      message: 'Assessment link generated and question sets are ready.',
       data: {
         assessmentLink,
         fullLink: `${process.env.FRONTEND_URL}/assessment/${assessmentLink}`,
-        startTime: jd.assessmentConfig.startTime,
-        endTime: jd.assessmentConfig.endTime,
-        status: 'generating_sets',
+        startTime: start,
+        endTime: end,
+        status: 'ready',
       },
-    });
-
-    // Trigger set generation (async, don't await)
-    generateQuestionSets(jd._id).catch(err => {
-      console.error('❌ Background set generation error:', err);
     });
 
   } catch (error) {
@@ -733,14 +830,13 @@ async function generateQuestionSets(jdId) {
     const jd = await JobDescription.findById(jdId);
     if (!jd) {
       console.error('❌ JD not found for set generation:', jdId);
-      return;
+      return { success: false, error: 'JD not found' };
     }
 
     const numberOfSets = jd.assessmentConfig.numberOfSets || 3;
     const sections = jd.assessmentConfig.sections;
-    const skills = jd.parsedContent.technicalSkills;
 
-    console.log(`🎯 Generating ${numberOfSets} sets for JD:`, jd._id);
+    console.log(`🎯 Generating ${numberOfSets} sets for JD: ${jd._id}`);
 
     const generatedSets = [];
 
@@ -755,7 +851,7 @@ async function generateQuestionSets(jdId) {
         programmingQuestions: [],
         generationMeta: {
           generatedAt: new Date(),
-          aiModel: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+          aiModel: process.env.OPENAI_MODEL || 'gpt-4o',
         },
       };
 
@@ -798,26 +894,30 @@ async function generateQuestionSets(jdId) {
       // Save the set
       const savedSet = await AssessmentSet.create(set);
       generatedSets.push(savedSet._id);
-      console.log(`✅ Set ${setNum} saved:`, savedSet._id);
+      console.log(`✅ Set ${setNum} saved: ${savedSet._id}`);
     }
 
-    // Update JD with generated sets
-    jd.assessmentSets = generatedSets;
-    jd.status = 'ready';
-    await jd.save();
+    // Update JD with generated sets using findByIdAndUpdate to avoid VersionError
+    await JobDescription.findByIdAndUpdate(jdId, {
+      $set: {
+        assessmentSets: generatedSets,
+        status: 'ready'
+      }
+    });
 
-    console.log(`✅ All ${numberOfSets} sets generated for JD:`, jd._id);
+    console.log(`✅ All ${numberOfSets} sets generated for JD: ${jdId}`);
+    return { success: true, sets: generatedSets };
 
   } catch (error) {
     console.error('❌ Error generating question sets:', error);
 
-    // Update JD status to indicate error
-    const jd = await JobDescription.findById(jdId);
-    if (jd) {
-      jd.status = 'parsed'; // Revert to parsed so they can try again
-      jd.parsingMeta.parseErrors = [...(jd.parsingMeta.parseErrors || []), error.message];
-      await jd.save();
-    }
+    // Update JD status to indicate error without using .save()
+    await JobDescription.findByIdAndUpdate(jdId, {
+      $set: { status: 'parsed' },
+      $push: { 'parsingMeta.parseErrors': error.message }
+    });
+
+    return { success: false, error: error.message };
   }
 }
 
@@ -834,31 +934,55 @@ Requirements:
 - Each question should have 4 options with exactly 1 correct answer
 - Cover various skills proportionally to their weights
 
-Return a JSON array of questions:
-[
-  {
-    "questionId": "obj_1",
-    "questionText": "Question text here?",
-    "options": [
-      {"text": "Option A", "isCorrect": false},
-      {"text": "Option B", "isCorrect": true},
-      {"text": "Option C", "isCorrect": false},
-      {"text": "Option D", "isCorrect": false}
-    ],
-    "skill": "Skill name",
-    "difficulty": "easy|medium|hard",
-    "points": 1,
-    "explanation": "Explanation of correct answer"
-  }
-]
+Return a JSON object with a "questions" key containing an array of questions:
+{
+  "questions": [
+    {
+      "questionId": "obj_1",
+      "questionText": "Question text here?",
+      "options": [
+        {"text": "Option A", "isCorrect": false},
+        {"text": "Option B", "isCorrect": true},
+        {"text": "Option C", "isCorrect": false},
+        {"text": "Option D", "isCorrect": false}
+      ],
+      "skill": "Skill name",
+      "difficulty": "easy|medium|hard",
+      "points": 1,
+      "explanation": "Explanation of correct answer"
+    }
+  ]
+}
 
-Return ONLY valid JSON, no markdown.`;
+IMPORTANT: You MUST use the exact keys: "questionId", "questionText", "options", "skill", "difficulty", "points", "explanation".
+Return ONLY valid JSON.`;
 
   try {
-    const result = await model.generateContent(prompt);
-    let response = result.response.text();
-    response = response.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const questions = JSON.parse(response);
+    const response = await callOpenAI(prompt, process.env.OPENAI_QUESTION_GEN_MODEL || 'gpt-4o', true);
+    console.log('🔹 Objective Questions Response:', JSON.stringify(response, null, 2));
+
+    // Handle both array and object responses for robustness
+    let questions = [];
+    if (Array.isArray(response)) {
+      questions = response;
+    } else if (response.questions && Array.isArray(response.questions)) {
+      questions = response.questions;
+    } else {
+      // Try to find any array in the object
+      const values = Object.values(response);
+      const arrayVal = values.find(v => Array.isArray(v));
+      if (arrayVal) questions = arrayVal;
+    }
+
+    // Validate and fix strict schema issues
+    questions = questions.map((q, i) => ({
+      ...q,
+      questionId: q.questionId || `obj_${i + 1}`,
+      questionText: q.questionText || q.text || q.question || "Question text missing",
+      points: q.points || 1,
+      difficulty: q.difficulty || "medium"
+    }));
+
     return { success: true, questions };
   } catch (error) {
     console.error('❌ Error generating objective questions:', error);
@@ -879,27 +1003,49 @@ Requirements:
 - Mix scenario-based and conceptual questions
 - Appropriate for the experience level
 
-Return a JSON array:
-[
-  {
-    "questionId": "sub_1",
-    "questionText": "Detailed question here?",
-    "expectedAnswer": "Key points the answer should cover",
-    "rubric": "Grading criteria: what to look for",
-    "skill": "Skill name",
-    "difficulty": "easy|medium|hard",
-    "points": 10,
-    "maxWords": 500
-  }
-]
+Return a JSON object with a "questions" key containing an array of questions:
+{
+  "questions": [
+    {
+      "questionId": "sub_1",
+      "questionText": "Detailed question here?",
+      "expectedAnswer": "Key points the answer should cover",
+      "rubric": "Grading criteria: what to look for",
+      "skill": "Skill name",
+      "difficulty": "easy|medium|hard",
+      "points": 10,
+      "maxWords": 500
+    }
+  ]
+}
 
-Return ONLY valid JSON, no markdown.`;
+IMPORTANT: You MUST use the exact keys: "questionId", "questionText", "expectedAnswer", "rubric", "skill", "difficulty", "points", "maxWords".
+Return ONLY valid JSON.`;
 
   try {
-    const result = await model.generateContent(prompt);
-    let response = result.response.text();
-    response = response.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const questions = JSON.parse(response);
+    const response = await callOpenAI(prompt, process.env.OPENAI_QUESTION_GEN_MODEL || 'gpt-4o', true);
+    console.log('🔹 Subjective Questions Response:', JSON.stringify(response, null, 2));
+
+    let questions = [];
+    if (Array.isArray(response)) {
+      questions = response;
+    } else if (response.questions && Array.isArray(response.questions)) {
+      questions = response.questions;
+    } else {
+      const values = Object.values(response);
+      const arrayVal = values.find(v => Array.isArray(v));
+      if (arrayVal) questions = arrayVal;
+    }
+
+    // Validate and fix strict schema issues
+    questions = questions.map((q, i) => ({
+      ...q,
+      questionId: q.questionId || `sub_${i + 1}`,
+      questionText: q.questionText || q.text || q.question || "Question text missing",
+      points: q.points || 10,
+      difficulty: q.difficulty || "medium"
+    }));
+
     return { success: true, questions };
   } catch (error) {
     console.error('❌ Error generating subjective questions:', error);
@@ -920,38 +1066,65 @@ Requirements:
 - Include 2-3 sample test cases and 2-3 hidden test cases
 - Appropriate complexity for the experience level
 
-Return a JSON array:
-[
-  {
-    "questionId": "prog_1",
-    "title": "Problem Title",
-    "questionText": "Complete problem description",
-    "description": "Additional context and requirements",
-    "constraints": "Input/output constraints",
-    "sampleInput": "Example input",
-    "sampleOutput": "Example output",
-    "testCases": [
-      {"input": "test input 1", "expectedOutput": "expected output 1", "isHidden": false, "isSample": true, "weight": 1},
-      {"input": "test input 2", "expectedOutput": "expected output 2", "isHidden": false, "isSample": true, "weight": 1},
-      {"input": "hidden test 1", "expectedOutput": "hidden output 1", "isHidden": true, "isSample": false, "weight": 2},
-      {"input": "hidden test 2", "expectedOutput": "hidden output 2", "isHidden": true, "isSample": false, "weight": 2}
-    ],
-    "skill": "Primary skill tested",
-    "difficulty": "easy|medium|hard",
-    "points": 20,
-    "allowedLanguages": ["python", "javascript", "java", "cpp"],
-    "timeLimit": 2,
-    "memoryLimit": 256
-  }
-]
+Return a JSON object with a "questions" key containing an array of questions:
+{
+  "questions": [
+    {
+      "questionId": "prog_1",
+      "title": "Problem Title",
+      "questionText": "Complete problem description",
+      "description": "Additional context and requirements",
+      "constraints": "Input/output constraints",
+      "sampleInput": "Example input",
+      "sampleOutput": "Example output",
+      "testCases": [
+        {"input": "test input 1", "expectedOutput": "expected output 1", "isHidden": false, "isSample": true, "weight": 1},
+        {"input": "test input 2", "expectedOutput": "expected output 2", "isHidden": false, "isSample": true, "weight": 1},
+        {"input": "hidden test 1", "expectedOutput": "hidden output 1", "isHidden": true, "isSample": false, "weight": 2},
+        {"input": "hidden test 2", "expectedOutput": "hidden output 2", "isHidden": true, "isSample": false, "weight": 2}
+      ],
+      "skill": "Primary skill tested",
+      "difficulty": "easy|medium|hard",
+      "points": 20,
+      "allowedLanguages": ["python", "javascript", "java", "cpp"],
+      "timeLimit": 2,
+      "memoryLimit": 256
+    }
+  ]
+}
 
-Return ONLY valid JSON, no markdown.`;
+IMPORTANT: You MUST use the exact keys: "questionId", "title", "questionText", "description", "testCases", "input", "expectedOutput".
+Return ONLY valid JSON.`;
 
   try {
-    const result = await model.generateContent(prompt);
-    let response = result.response.text();
-    response = response.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const questions = JSON.parse(response);
+    const response = await callOpenAI(prompt, process.env.OPENAI_QUESTION_GEN_MODEL || 'gpt-4o', true);
+    console.log('🔹 Programming Questions Response:', JSON.stringify(response, null, 2));
+
+    let questions = [];
+    if (Array.isArray(response)) {
+      questions = response;
+    } else if (response.questions && Array.isArray(response.questions)) {
+      questions = response.questions;
+    } else {
+      const values = Object.values(response);
+      const arrayVal = values.find(v => Array.isArray(v));
+      if (arrayVal) questions = arrayVal;
+    }
+
+    // Validate and fix strict schema issues
+    questions = questions.map((q, i) => ({
+      ...q,
+      questionId: q.questionId || `prog_${i + 1}`,
+      questionText: q.questionText || q.question || q.text || "Question text missing",
+      title: q.title || "Untitled Problem",
+      testCases: (q.testCases || []).map(tc => ({
+        ...tc,
+        expectedOutput: tc.expectedOutput || tc.output || ""
+      })),
+      points: q.points || 20,
+      difficulty: q.difficulty || "medium"
+    }));
+
     return { success: true, questions };
   } catch (error) {
     console.error('❌ Error generating programming questions:', error);

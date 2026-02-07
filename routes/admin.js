@@ -18,14 +18,60 @@ const router = express.Router();
  */
 router.get('/jds', authenticateToken, requireRecruiter, async (req, res) => {
     try {
-        const jds = await JobDescription.find({ company: req.user.company })
+        const { page = 1, limit = 10, format = 'json' } = req.query;
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        // Base query
+        const query = { company: req.user.company };
+
+        // If CSV export, fetch all matching documents
+        if (format === 'csv') {
+            const jds = await JobDescription.find(query)
+                .sort({ createdAt: -1 })
+                .select('parsedContent.roleTitle status stats assessmentConfig.startTime assessmentConfig.endTime assessmentConfig.assessmentLink createdAt')
+                .lean();
+
+            // Generate CSV
+            const headers = ['Role Title', 'Status', 'Candidates', 'Created Date', 'Assessment Link'];
+            const rows = jds.map(jd => {
+                const link = jd.assessmentConfig?.assessmentLink
+                    ? `${process.env.FRONTEND_URL || 'http://localhost:3000'}/assess/${jd.assessmentConfig.assessmentLink}`
+                    : 'N/A';
+
+                return [
+                    `"${jd.parsedContent?.roleTitle || 'Untitled'}"`,
+                    jd.status,
+                    jd.stats?.totalCandidates || 0,
+                    new Date(jd.createdAt).toLocaleDateString(),
+                    link
+                ].join(',');
+            }).join('\n');
+
+            const csv = headers.join(',') + '\n' + rows;
+
+            res.setHeader('Content-Type', 'text/csv');
+            res.setHeader('Content-Disposition', 'attachment; filename="assessments-history.csv"');
+            return res.send(csv);
+        }
+
+        // Pagination
+        const total = await JobDescription.countDocuments(query);
+        const jds = await JobDescription.find(query)
             .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(parseInt(limit))
             .select('parsedContent.roleTitle status stats assessmentConfig.startTime assessmentConfig.endTime assessmentConfig.assessmentLink createdAt')
             .lean();
 
         res.json({
             success: true,
             data: jds,
+            pagination: {
+                total,
+                page: parseInt(page),
+                limit: parseInt(limit),
+                pages: Math.ceil(total / parseInt(limit))
+            }
         });
     } catch (error) {
         console.error('❌ Get JDs error:', error);

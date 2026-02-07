@@ -38,6 +38,10 @@ const JobDescriptionSchema = new mongoose.Schema(
         type: String,
         default: '',
       },
+      companyName: {
+        type: String,
+        default: '',
+      },
       aboutCompany: {
         type: String,
         default: '',
@@ -63,6 +67,7 @@ const JobDescriptionSchema = new mongoose.Schema(
       // Technical skills with weights and difficulty
       technicalSkills: [{
         name: { type: String, required: true },
+        category: { type: String, default: 'Other' },
         weight: { type: Number, min: 1, max: 10, default: 5 },
         difficulty: {
           type: String,
@@ -110,9 +115,16 @@ const JobDescriptionSchema = new mongoose.Schema(
       // Resume matching threshold
       resumeMatchThreshold: {
         type: Number,
-        default: 90,
+        default: 70,
         min: 0,
         max: 100,
+      },
+
+      // Difficulty distribution
+      difficultyDistribution: {
+        easy: { type: Number, default: 20 },
+        medium: { type: Number, default: 50 },
+        hard: { type: Number, default: 30 },
       },
 
       // Section breakdown
@@ -230,7 +242,8 @@ const JobDescriptionSchema = new mongoose.Schema(
 // Indexes
 JobDescriptionSchema.index({ company: 1, createdAt: -1 });
 JobDescriptionSchema.index({ recruiter: 1, createdAt: -1 });
-JobDescriptionSchema.index({ assessmentLink: 1 });
+// Redundant with unique: true in field definition
+// JobDescriptionSchema.index({ assessmentLink: 1 });
 JobDescriptionSchema.index({ status: 1 });
 JobDescriptionSchema.index({ 'assessmentConfig.startTime': 1, 'assessmentConfig.endTime': 1 });
 

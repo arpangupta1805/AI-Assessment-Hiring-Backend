@@ -12,8 +12,10 @@ import feedbackinterview from '../models/feedbackofinterview.js';
 import FollowUpQuestion from '../models/FollowUpQuestion.js';
 import InterviewMetadata from '../models/InterviewMetadata.js';
 import { detectFollowUpNeed, generateFollowUpQuestion, checkFollowUpHeuristics, extractFirstBalancedJSON } from '../services/followUpService.js';
+import { callOpenAI } from '../lib/openai.js';
 
 const router = express.Router();
+
 
 // Token estimation helper (rough heuristic): 1 token ≈ 4 characters
 const estimateTokens = (text) => {
@@ -22,163 +24,6 @@ const estimateTokens = (text) => {
   return Math.max(1, Math.ceil(text.length / 4));
 };
 
-// Cost rates per 1K tokens (examples, update to match your billing):
-// These are rough example rates. Replace with actual model pricing as needed.
-const MODEL_RATES_PER_1K = {
-  'gemini-2.0': { input: 0.00125, output: 0.01 }, // $ per 1K tokens (example)
-  'gemini-2.0-flash': { input: 0.00025, output: 0.02 },
-};
-
-// Helper function to call Gemini API with retry logic and exponential backoff
-// This wrapper also logs an estimated token consumption and approximate cost per call
-const callGeminiWithRetry = async (prompt, maxRetries = 3) => {
-  const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
-
-  // Estimate prompt tokens
-  const promptText = String(prompt || '');
-  const promptTokens = estimateTokens(promptText);
-
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: promptText }] }],
-        }),
-      });
-
-      // Handle rate limiting (429)
-      if (response.status === 429) {
-        const retryAfter = response.headers.get('retry-after');
-        const delay = retryAfter ? parseInt(retryAfter) * 1000 : Math.pow(2, attempt) * 5000;
-        console.log(`⚠️  Rate limited (429). Retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})...`);
-        if (attempt < maxRetries - 1) {
-          await new Promise((resolve) => setTimeout(resolve, delay));
-          continue;
-        } else {
-          throw new Error('Gemini API rate limit exceeded. Please try again later.');
-        }
-      }
-
-      // Handle service overload (503)
-      if (response.status === 503) {
-        const delay = Math.pow(2, attempt + 1) * 1000;
-        console.log(`⚠️  Service overloaded (503). Retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})...`);
-        if (attempt < maxRetries - 1) {
-          await new Promise((resolve) => setTimeout(resolve, delay));
-          continue;
-        } else {
-          throw new Error('Gemini API service is overloaded. Please try again later.');
-        }
-      }
-
-      // Handle other HTTP errors
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Gemini API error (${response.status}): ${errorText}`);
-      }
-
-      const json = await response.json();
-
-      // Estimate response tokens from returned text (best-effort)
-      const responseText = json?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      const responseTokens = estimateTokens(responseText);
-
-      const rates = MODEL_RATES_PER_1K[model] || MODEL_RATES_PER_1K['gemini-2.0-flash'];
-      const inputCost = (promptTokens / 1000) * rates.input;
-      const outputCost = (responseTokens / 1000) * rates.output;
-      const callCost = inputCost + outputCost;
-
-      console.log(`🧾 Gemini call (${model}) tokens — prompt: ${promptTokens}, response: ${responseTokens}, total: ${promptTokens + responseTokens}. Approx cost: $${callCost.toFixed(6)}`);
-
-      return json;
-    } catch (error) {
-      if (attempt === maxRetries - 1 || error.message.includes('rate limit')) {
-        throw error;
-      }
-      const delay = Math.pow(2, attempt) * 1000;
-      console.log(`⚠️  Gemini API error: ${error.message}. Retrying in ${delay}ms...`);
-      await new Promise((resolve) => setTimeout(resolve, delay));
-    }
-  }
-};
-
-// Helper wrapper that asks Gemini to return STRICT JSON and will retry asking the model
-// to reformat its previous output if parsing fails. Uses extractFirstBalancedJSON to
-// robustly pull JSON from noisy text, then requests a reformat if needed.
-const callGeminiJSON = async (prompt, exampleJsonString = null, maxCalls = 3) => {
-  // maxCalls limits the TOTAL number of calls to Gemini (initial + any reformat attempts).
-  // This guarantees we never loop indefinitely. Default = 3 calls total.
-  let callsMade = 0;
-  let lastText = '';
-
-  while (callsMade < maxCalls) {
-    // 1) Make a normal call
-    try {
-  callsMade++;
-  const resp = await callGeminiWithRetry(prompt, 1);
-  lastText = resp?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-      if (!lastText || /202|still being generated|partial data/i.test(lastText)) {
-        throw new Error('Model returned partial or empty response');
-      }
-
-      const extracted = extractFirstBalancedJSON(lastText);
-      if (extracted) {
-        try {
-          const parsed = typeof extracted === 'string' ? JSON.parse(extracted) : extracted;
-          return parsed;
-        } catch (parseError) {
-          console.warn('⚠️  Extracted JSON could not be parsed:', parseError.message);
-          // continue to possible reformat (if calls left)
-        }
-      } else {
-        console.warn('⚠️  No balanced JSON found in model response');
-      }
-    } catch (err) {
-      console.warn(`⚠️  callGeminiJSON call #${callsMade} failed: ${err.message}`);
-    }
-
-    // 2) If we still have budget for calls, ask the model to reformat the previous output
-    if (callsMade < maxCalls) {
-      const reformatInstruction = `The previous response was not valid JSON. You must now reformat the previous output into a single, valid JSON object and return ONLY that JSON object (no explanation, no markdown, no code fences).` +
-        (exampleJsonString ? ` The required JSON schema/example is:\n${exampleJsonString}` : '') +
-        `\n\nHere is the previous model output:\n"""\n${lastText}\n"""\n\nReturn only the JSON object.`;
-
-      try {
-        callsMade++;
-        const retryResp = await callGeminiWithRetry(reformatInstruction, 1);
-        const retryText = retryResp?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        const retryExtracted = extractFirstBalancedJSON(retryText);
-        if (retryExtracted) {
-          try {
-            const parsedRetry = typeof retryExtracted === 'string' ? JSON.parse(retryExtracted) : retryExtracted;
-            return parsedRetry;
-          } catch (e) {
-            console.warn('⚠️  Retried JSON still failed to parse:', e.message);
-            lastText = retryText;
-            // loop will continue if calls remain
-          }
-        } else {
-          console.warn('⚠️  Reformat attempt did not produce balanced JSON');
-          lastText = retryText;
-        }
-      } catch (retryErr) {
-        console.warn('⚠️  Reformat retry call failed:', retryErr.message);
-      }
-    }
-  }
-
-  console.error('❌ callGeminiJSON: failed to obtain valid JSON after maxCalls=', maxCalls);
-  return null;
-};
-
-// Helper function to get difficulty level key for skills model
-// Helper function to map difficulty level to question bank array field
-// Frontend sends: 'Basic', 'Medium', 'Hard', 'Expert'
-// Maps to 3 database tiers: Easy (Basic), Medium, Hard (Hard+Expert)
 const getDifficultyKey = (level) => {
   const levelMap = {
     'Basic': 'arrofeasyquestionbankids',
@@ -208,14 +53,14 @@ const normalizeDifficultyLevel = (level) => {
 const getQuestionCount = (duration) => {
   // Extract number from duration string (e.g., "3 mins" -> "3")
   const durationNumber = duration?.toString().split(' ')[0] || duration;
-  
+
   // Use min value from getQuestionLimits for base question generation
   const durationMap = {
     '3': 2,   // min for 3 min interview
     '5': 4,   // min for 5 min interview
     '20': 10, // min for 20 min interview
   };
-  
+
   const questionCount = durationMap[durationNumber] || 5; // Default to 5 if duration not found
   console.log(`📊 Duration: "${duration}" -> Number: "${durationNumber}" -> Base Questions: ${questionCount}`);
   return questionCount;
@@ -225,13 +70,13 @@ const getQuestionCount = (duration) => {
 const getQuestionLimits = (duration) => {
   // Extract number from duration string (e.g., "3 mins" -> "3")
   const durationNumber = duration?.toString().split(' ')[0] || duration;
-  
+
   const limitsMap = {
     '3': { min: 2, max: 6 },    // 3 min interview: 2-6 questions
     '5': { min: 4, max: 10 },   // 5 min interview: 4-10 questions
     '20': { min: 10, max: 16 }, // 20 min interview: 10-16 questions
   };
-  
+
   const limits = limitsMap[durationNumber] || { min: 5, max: 20 };
   console.log(`📊 Duration limits: "${duration}" -> min=${limits.min}, max=${limits.max}`);
   return limits;
@@ -242,7 +87,7 @@ const getQuestionLimits = (duration) => {
 router.post('/start', authenticateToken, async (req, res) => {
   try {
     const { skillName, jdId, jdText, jdTitle, resumeId, resumeText, resumeTitle, level, description, duration } = req.body;
-    
+
     // Debug: Check if user is authenticated
     if (!req.user) {
       console.error('❌ No user object in request - authentication failed');
@@ -251,9 +96,9 @@ router.post('/start', authenticateToken, async (req, res) => {
         error: 'User not authenticated',
       });
     }
-    
+
     const username = req.user.username;
-    
+
     if (!username) {
       console.error('❌ Username not found in user object:', req.user);
       return res.status(401).json({
@@ -269,7 +114,7 @@ router.post('/start', authenticateToken, async (req, res) => {
 
     // Validation - exactly one type must be specified
     const interviewTypesCount = (isJdInterview ? 1 : 0) + (isSkillInterview ? 1 : 0) + (isResumeInterview ? 1 : 0);
-    
+
     if (interviewTypesCount === 0) {
       return res.status(400).json({
         success: false,
@@ -431,12 +276,12 @@ router.post('/start', authenticateToken, async (req, res) => {
 
       interviewName = jd.title;
       interviewDescription = jd.jdText;
-    } 
+    }
     // Handle skill-based interview
     else {
       const escapedSkillName = skillName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      skill = await SkillName.findOne({ 
-        name: { $regex: new RegExp(`^${escapedSkillName}$`, 'i') } 
+      skill = await SkillName.findOne({
+        name: { $regex: new RegExp(`^${escapedSkillName}$`, 'i') }
       });
 
       console.log('🔍 Searching for skill:', skillName);
@@ -459,30 +304,30 @@ router.post('/start', authenticateToken, async (req, res) => {
 
     // Find or create public interview record
     let publicInterview = await interview.findOne(
-      isJdInterview 
+      isJdInterview
         ? { jdid: jd._id.toString(), difflevel: normalizedLevel }
         : isResumeInterview
-        ? { resumeid: resume._id.toString(), difflevel: normalizedLevel }
-        : { skillid: skill._id.toString(), difflevel: normalizedLevel }
+          ? { resumeid: resume._id.toString(), difflevel: normalizedLevel }
+          : { skillid: skill._id.toString(), difflevel: normalizedLevel }
     );
 
     if (!publicInterview) {
       publicInterview = await interview.create(
         isJdInterview
           ? {
-              jdid: jd._id.toString(),
-              difflevel: normalizedLevel,
-              count: 0,
-              ArrofQuestionbankids: [],
-            }
+            jdid: jd._id.toString(),
+            difflevel: normalizedLevel,
+            count: 0,
+            ArrofQuestionbankids: [],
+          }
           : isResumeInterview
-          ? {
+            ? {
               resumeid: resume._id.toString(),
               difflevel: normalizedLevel,
               count: 0,
               ArrofQuestionbankids: [],
             }
-          : {
+            : {
               skillid: skill._id.toString(),
               difflevel: normalizedLevel,
               count: 0,
@@ -498,13 +343,13 @@ router.post('/start', authenticateToken, async (req, res) => {
     // Always generate new questions from AI (no reuse of existing question banks)
     console.log('🤖 Generating new questions with AI...');
     let questionBank = null;
-    
+
     // Calculate number of questions based on duration
     const questionCount = getQuestionCount(duration);
-    
-    // Generate questions using Gemini API
+
+    // Generate questions using AI
     let prompt;
-    
+
     if (isJdInterview) {
       prompt = `You are an expert technical interviewer. Generate ${questionCount} subjective interview questions for a mock interview based on the following job description:
 
@@ -573,8 +418,9 @@ Format the response as a JSON array with exactly ${questionCount} objects, each 
 Return ONLY the JSON array, no additional text or markdown formatting.`;
     }
 
-    const data = await callGeminiWithRetry(prompt);
-    const aiResponse = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    // Call Open AI
+    const aiResponse = await callOpenAI(prompt, process.env.OPENAI_QUESTION_GEN_MODEL || 'gpt-4o', false);
+
 
     console.log('🤖 AI Response received');
 
@@ -599,19 +445,19 @@ Return ONLY the JSON array, no additional text or markdown formatting.`;
     questionBank = await QuestionBank.create(
       isJdInterview
         ? {
-            questionarr: questions,
-            expectedansarr: expectedAnswers,
-            difficultylevel: normalizedLevel,
-            jdid: jd._id.toString(),
-          }
+          questionarr: questions,
+          expectedansarr: expectedAnswers,
+          difficultylevel: normalizedLevel,
+          jdid: jd._id.toString(),
+        }
         : isResumeInterview
-        ? {
+          ? {
             questionarr: questions,
             expectedansarr: expectedAnswers,
             difficultylevel: normalizedLevel,
             resumeid: resume._id.toString(),
           }
-        : {
+          : {
             questionarr: questions,
             expectedansarr: expectedAnswers,
             difficultylevel: normalizedLevel,
@@ -648,7 +494,7 @@ Return ONLY the JSON array, no additional text or markdown formatting.`;
 
     // Create or update user's private interview record
     let userInterviews = await interviews.findOne({ username });
-    
+
     if (!userInterviews) {
       try {
         userInterviews = await interviews.create({
@@ -667,7 +513,7 @@ Return ONLY the JSON array, no additional text or markdown formatting.`;
         }
       }
     }
-    
+
     if (userInterviews) {
       // Add skill if skill-based interview and not already present
       if (isSkillInterview && !userInterviews.Arrofskillids.includes(skill._id.toString())) {
@@ -726,7 +572,7 @@ Return ONLY the JSON array, no additional text or markdown formatting.`;
     try {
       const limits = getQuestionLimits(duration);
       const baseQuestionCount = questionBank.questionarr.length;
-      
+
       interviewMetadata = await InterviewMetadata.create({
         username: username,
         candidateAnsBankId: candidateDraft._id.toString(),
@@ -828,7 +674,7 @@ router.post('/submit', authenticateToken, async (req, res) => {
 
     // Find question bank
     const questionBank = await QuestionBank.findById(questionBankId);
-    
+
     if (!questionBank) {
       return res.status(404).json({
         success: false,
@@ -866,7 +712,7 @@ router.post('/submit', authenticateToken, async (req, res) => {
 
     // Update user's interviews document
     const userInterviews = await interviews.findOne({ username });
-    
+
     if (userInterviews) {
       try {
         userInterviews.ArrofCandidatebankids.push(candidateAns._id.toString());
@@ -923,7 +769,7 @@ router.post('/submit', authenticateToken, async (req, res) => {
           }
         }
       }
-      
+
       if (followUps.length > 0) {
         console.log(`✅ Updated ${followUps.length} follow-up question answers`);
       }
@@ -1001,7 +847,7 @@ router.post('/generate-feedback', authenticateToken, async (req, res) => {
 
     // Find candidate answer bank
     const candidateAns = await candidateansbank.findById(candidateAnsBankId);
-    
+
     if (!candidateAns) {
       return res.status(404).json({
         success: false,
@@ -1019,7 +865,7 @@ router.post('/generate-feedback', authenticateToken, async (req, res) => {
 
     // Find question bank
     const questionBank = await QuestionBank.findById(candidateAns.Questionbankid);
-    
+
     if (!questionBank) {
       return res.status(404).json({
         success: false,
@@ -1039,11 +885,11 @@ router.post('/generate-feedback', authenticateToken, async (req, res) => {
     const questions = questionBank.questionarr;
     const expectedAnswers = questionBank.expectedansarr;
     const userAnswers = candidateAns.ansArray;
-    
+
     // Get summarized answers (use original if not available)
     const summarizedAnswers = candidateAns.summarizedAnsArray || [];
     const useSummarizedAnswers = summarizedAnswers.length > 0;
-    
+
     if (useSummarizedAnswers) {
       console.log('✅ Using summarized answers for feedback generation');
     } else {
@@ -1104,10 +950,10 @@ router.post('/generate-feedback', authenticateToken, async (req, res) => {
 
     // Aggregate visual data per question for feedback
     const visualDataByQuestion = {};
-    
+
     if (candidateAns.visualDataArray && candidateAns.visualDataArray.length > 0) {
       console.log(`📹 Processing ${candidateAns.visualDataArray.length} visual snapshots for feedback`);
-      
+
       // Group visual data by question number
       for (const snapshot of candidateAns.visualDataArray) {
         const qNum = snapshot.questionNumber;
@@ -1116,27 +962,27 @@ router.post('/generate-feedback', authenticateToken, async (req, res) => {
         }
         visualDataByQuestion[qNum].push(snapshot);
       }
-      
+
       // Calculate aggregates for each question
       for (const qNum in visualDataByQuestion) {
         const snapshots = visualDataByQuestion[qNum];
         const focusedCount = snapshots.filter(s => s.isFocused).length;
         const focusPercentage = (focusedCount / snapshots.length) * 100;
-        
+
         // Calculate dominant expression
         const expressionCounts = {};
         for (const s of snapshots) {
           expressionCounts[s.expression] = (expressionCounts[s.expression] || 0) + 1;
         }
         const dominantExpression = Object.entries(expressionCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || 'NEUTRAL';
-        
+
         // Calculate gaze distribution
         const gazeCounts = {};
         for (const s of snapshots) {
           gazeCounts[s.gazeDirection] = (gazeCounts[s.gazeDirection] || 0) + 1;
         }
         const dominantGaze = Object.entries(gazeCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || 'CENTER';
-        
+
         visualDataByQuestion[qNum] = {
           totalSnapshots: snapshots.length,
           focusPercentage: focusPercentage.toFixed(1),
@@ -1208,10 +1054,11 @@ IMPORTANT FORMATTING RULES:
 Return ONLY the JSON array, no additional text.`;
 
     let questionFeedbacks = [];
-    
+
     try {
-      const data = await callGeminiWithRetry(questionFeedbackPrompt);
-      const aiResponse = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+      const aiResponse = await callOpenAI(questionFeedbackPrompt, process.env.OPENAI_MODEL || 'gpt-4o', false);
+
 
       console.log('🤖 Question feedback AI response received');
 
@@ -1288,7 +1135,7 @@ Return ONLY the JSON array, no additional text.`;
     feedbackDict.set('whatwentwell', whatWentWellArr);
     feedbackDict.set('overallcomments', overallCommentsArr);
     feedbackDict.set('visualPerformance', visualPerformanceArr);
-    
+
     candidateAns.Feedbackdict = feedbackDict;
     await candidateAns.save();
 
@@ -1304,7 +1151,7 @@ Return ONLY the JSON array, no additional text.`;
     let interviewName = 'Unknown';
     let interviewDescription = '';
     let interviewType = 'Skill';
-    
+
     try {
       // Check if it's a skill-based interview
       if (questionBank.skillid) {
@@ -1314,7 +1161,7 @@ Return ONLY the JSON array, no additional text.`;
           interviewDescription = skill.description || '';
           interviewType = 'Skill';
         }
-      } 
+      }
       // Check if it's a JD-based interview
       else if (questionBank.jdid) {
         const jd = await JobDescription.findById(questionBank.jdid);
@@ -1343,7 +1190,7 @@ Return ONLY the JSON array, no additional text.`;
       const totalSnapshots = candidateAns.visualDataArray.length;
       const focusedSnapshots = candidateAns.visualDataArray.filter(s => s.isFocused).length;
       const overallFocusPercentage = (focusedSnapshots / totalSnapshots) * 100;
-      
+
       // Expression distribution (keep raw counts for storage and percentages for readable prompts)
       const expressionCounts = {};
       for (const s of candidateAns.visualDataArray) {
@@ -1378,12 +1225,12 @@ Return ONLY the JSON array, no additional text.`;
         gazeDistributionReadable,
         questionsCovered: Object.keys(visualDataByQuestion).length,
       };
-      
+
       console.log('📊 Overall Visual Summary:', overallVisualSummary);
     }
 
     // Create three separate prompts for parallel API calls to get better quality responses
-    
+
     // Prompt 1: Overview and Growth Improvement (detailed and authentic)
     const overviewPrompt = `You are a senior technical interviewer having a one-on-one feedback session with a candidate who just completed their interview.
 
@@ -1539,16 +1386,16 @@ Return ONLY the JSON object, no additional text.`;
 
 **Question-by-Question Visual Performance**:
 ${allQuestionsForFeedback.map((qData, i) => {
-  const visualInfo = visualDataByQuestion[qData.questionNumber];
-  if (!visualInfo) return `Question ${i + 1}: No visual data captured`;
-  return `
+      const visualInfo = visualDataByQuestion[qData.questionNumber];
+      if (!visualInfo) return `Question ${i + 1}: No visual data captured`;
+      return `
 Question ${i + 1}${qData.isFollowUp ? ' (Follow-up)' : ''}: ${qData.question.substring(0, 80)}...
 - Focus on Camera: ${visualInfo.focusPercentage}%
 - Dominant Expression: ${visualInfo.dominantExpression}
 - Gaze Pattern: ${visualInfo.dominantGaze}
 - Expression Breakdown: ${Object.entries(visualInfo.expressionDistribution).map(([expr, count]) => `${expr}(${count})`).join(', ')}
 - Gaze Breakdown: ${Object.entries(visualInfo.gazeDistribution).map(([gaze, count]) => `${gaze}(${count})`).join(', ')}`;
-}).join('\n---\n')}
+    }).join('\n---\n')}
 
 Analyze the candidate's visual performance and body language throughout the interview. Provide a comprehensive assessment of their non-verbal communication.
 
@@ -1589,7 +1436,7 @@ Return ONLY the JSON object, no additional text.` : null;
 
     // Make sequential API calls to avoid rate limiting (instead of parallel)
     console.log('📊 Making sequential API calls for: 1) Overview & Growth, 2) Scoring, 3) Visual Analysis');
-    
+
     // Initialize with default values in case API calls fail
     let overviewData = {
       overview: 'Your interview performance is being analyzed. Please check back later for detailed feedback.'
@@ -1603,16 +1450,29 @@ Return ONLY the JSON object, no additional text.` : null;
       totalScore: 5
     };
     let visualAnalysisData = null;
-    
     try {
       // Call 1: Overview & Growth (with individual error handling)
       try {
         console.log('📊 Calling API 1/3: Overview & Growth...');
-        const overviewResult = await callGeminiWithRetry(overviewPrompt);
-        const overviewResponse = overviewResult?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        
-        // Use robust JSON extraction (handles control characters and extra text)
-        const parsedOverview = extractFirstBalancedJSON(overviewResponse);
+
+        const aiResponse = await callOpenAI(overviewPrompt, process.env.OPENAI_MODEL || 'gpt-4o', false);
+
+        // Parse the response
+        let parsedOverview;
+        try {
+          // Remove Markdown formatting if any
+          let jsonStr = aiResponse.trim();
+          if (jsonStr.startsWith('```json')) {
+            jsonStr = jsonStr.replace(/^```json\s*/, '').replace(/```\s*$/, '');
+          } else if (jsonStr.startsWith('```')) {
+            jsonStr = jsonStr.replace(/^```\s*/, '').replace(/```\s*$/, '');
+          }
+
+          parsedOverview = JSON.parse(jsonStr);
+        } catch (e) {
+          console.error('Failed to parse overview JSON', e);
+          throw new Error('Failed to parse overview JSON');
+        }
         if (parsedOverview) {
           overviewData = parsedOverview;
           console.log('✅ Overview & Growth data parsed successfully');
@@ -1623,18 +1483,32 @@ Return ONLY the JSON object, no additional text.` : null;
         console.error('⚠️  Overview & Growth API call failed:', overviewError.message);
         console.log('📊 Continuing with default overview data...');
       }
-      
+
       // Delay before next call to avoid rate limiting
       await new Promise(resolve => setTimeout(resolve, 3000)); // 3 second delay (increased)
-      
+
       // Call 2: Scoring (with individual error handling)
       try {
         console.log('📊 Calling API 2/3: Scoring...');
-        const scoringResult = await callGeminiWithRetry(scoringPrompt);
-        const scoringResponse = scoringResult?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        
-        // Use robust JSON extraction (handles control characters and extra text)
-        const parsedScoring = extractFirstBalancedJSON(scoringResponse);
+
+        const aiResponseScoring = await callOpenAI(scoringPrompt, process.env.OPENAI_MODEL || 'gpt-4o', false);
+
+        // Parse the response
+        let parsedScoring;
+        try {
+          // Remove Markdown formatting if any
+          let jsonStr = aiResponseScoring.trim();
+          if (jsonStr.startsWith('```json')) {
+            jsonStr = jsonStr.replace(/^```json\s*/, '').replace(/```\s*$/, '');
+          } else if (jsonStr.startsWith('```')) {
+            jsonStr = jsonStr.replace(/^```\s*/, '').replace(/```\s*$/, '');
+          }
+
+          parsedScoring = JSON.parse(jsonStr);
+        } catch (e) {
+          console.error('Failed to parse scoring JSON', e);
+          throw new Error('Failed to parse scoring JSON');
+        }
         if (parsedScoring) {
           scoringData = parsedScoring;
           console.log('✅ Scoring data parsed successfully');
@@ -1645,11 +1519,11 @@ Return ONLY the JSON object, no additional text.` : null;
         console.error('⚠️  Scoring API call failed:', scoringError.message);
         console.log('📊 Continuing with default scoring data...');
       }
-      
+
       // Delay before next call to avoid rate limiting
       await new Promise(resolve => setTimeout(resolve, 3000)); // 3 second delay (increased)
       console.log('⏰ 3-second delay completed, proceeding to visual analysis check...');
-      
+
       // Parse Visual Analysis response (if present, with individual error handling)
       if (visualAnalysisPrompt) {
         try {
@@ -1660,28 +1534,29 @@ Return ONLY the JSON object, no additional text.` : null;
             areasForImprovement: ["First improvement suggestion", "Second improvement", "Third improvement"]
           }, null, 2);
 
-          const visualParsed = await callGeminiJSON(visualAnalysisPrompt + '\n\nIMPORTANT: Return only the JSON object exactly matching the schema provided. Both fields MUST be arrays of strings.', schemaExample, 2);
+          // Use callOpenAI with jsonMode=true
+          const visualParsed = await callOpenAI(visualAnalysisPrompt + '\n\nIMPORTANT: Return only the JSON object exactly matching the schema provided. Both fields MUST be arrays of strings.', process.env.OPENAI_MODEL || 'gpt-4o', true);
+
 
           if (visualParsed) {
             visualAnalysisData = visualParsed;
             // Validate required fields and types (now supports both array and string for backward compatibility)
             // If data is incomplete or invalid, set to null so it won't be saved
-            const isEngagementValid = visualAnalysisData.overallEngagement && 
-                                      (Array.isArray(visualAnalysisData.overallEngagement) || 
-                                       (typeof visualAnalysisData.overallEngagement === 'string' && 
-                                        visualAnalysisData.overallEngagement !== 'Visual analysis data incomplete'));
-            
-            const isImprovementValid = visualAnalysisData.areasForImprovement && 
-                                       (Array.isArray(visualAnalysisData.areasForImprovement) || 
-                                        (typeof visualAnalysisData.areasForImprovement === 'string' && 
-                                         visualAnalysisData.areasForImprovement !== 'Visual analysis data incomplete'));
-            
+            const isEngagementValid = visualAnalysisData.overallEngagement &&
+              (Array.isArray(visualAnalysisData.overallEngagement) ||
+                (typeof visualAnalysisData.overallEngagement === 'string' &&
+                  visualAnalysisData.overallEngagement !== 'Visual analysis data incomplete'));
+
+            const isImprovementValid = visualAnalysisData.areasForImprovement &&
+              (Array.isArray(visualAnalysisData.areasForImprovement) ||
+                (typeof visualAnalysisData.areasForImprovement === 'string' &&
+                  visualAnalysisData.areasForImprovement !== 'Visual analysis data incomplete'));
+
             if (!isEngagementValid || !isImprovementValid) {
               console.warn('⚠️  Visual analysis data incomplete or invalid, skipping visual analysis');
               visualAnalysisData = null;
             } else {
               // Log the types received
-              console.log('✅ Visual Analysis data parsed successfully (via callGeminiJSON)');
               console.log('   - overallEngagement type:', Array.isArray(visualAnalysisData.overallEngagement) ? 'array' : typeof visualAnalysisData.overallEngagement);
               console.log('   - areasForImprovement type:', Array.isArray(visualAnalysisData.areasForImprovement) ? 'array' : typeof visualAnalysisData.areasForImprovement);
             }
@@ -1693,7 +1568,7 @@ Return ONLY the JSON object, no additional text.` : null;
           console.log('📊 Continuing without visual analysis data...');
         }
       }
-      
+
       // Combine all the feedback data
       // Keep arrays as arrays for frontend to display as bullet points
       // Only convert to string if it's not already an array (backward compatibility)
@@ -1717,7 +1592,7 @@ Return ONLY the JSON object, no additional text.` : null;
         totalScore: scoringData.totalScore || 0,
         growthFromLastInterview: growthText,
       };
-      
+
       // Add visual analysis if present
       if (visualAnalysisData) {
         overallFeedback.visualAnalysis = {
@@ -1746,9 +1621,9 @@ Return ONLY the JSON object, no additional text.` : null;
         difflevel: questionBank.difficultylevel,
         ArrofQuestionbankids: candidateAns.Questionbankid
       });
-      
+
       const interviewId = interviewDoc?._id?.toString() || 'unknown';
-      
+
       if (!interviewDoc) {
         console.warn('⚠️  Could not find interview document for this question bank');
         console.warn('QuestionBank ID:', candidateAns.Questionbankid);
@@ -1818,14 +1693,14 @@ Return ONLY the JSON object, no additional text.` : null;
       }
 
       console.log('✅ Overall feedback saved to feedbackinterview');
-      
+
       // CRITICAL: Update metadata status to 'completed' so GET endpoint stops returning 202
       if (metadata) {
         metadata.status = 'completed';
         await metadata.save();
         console.log('✅ Updated interview metadata status to completed');
       }
-      
+
       console.log('✅ Feedback generation completed successfully');
       console.log('='.repeat(80) + '\n');
 
@@ -1858,7 +1733,7 @@ Return ONLY the JSON object, no additional text.` : null;
       });
     } catch (error) {
       console.error('❌ Error generating overall feedback:', error);
-      
+
       // Even if overall feedback fails, we still have question feedback saved
       // Return partial success
       res.status(500).json({
@@ -1958,7 +1833,7 @@ router.get('/feedback/:candidateAnsBankId', authenticateToken, async (req, res) 
 
     // Find candidate answer bank
     const candidateAns = await candidateansbank.findById(candidateAnsBankId);
-    
+
     if (!candidateAns) {
       return res.status(404).json({
         success: false,
@@ -1976,7 +1851,7 @@ router.get('/feedback/:candidateAnsBankId', authenticateToken, async (req, res) 
 
     // Find question bank
     const questionBank = await QuestionBank.findById(candidateAns.Questionbankid);
-    
+
     if (!questionBank) {
       return res.status(404).json({
         success: false,
@@ -1986,17 +1861,17 @@ router.get('/feedback/:candidateAnsBankId', authenticateToken, async (req, res) 
 
     // CRITICAL: Check if feedback is still being generated
     const metadata = await InterviewMetadata.findOne({ candidateAnsBankId: String(candidateAnsBankId) });
-    
+
     if (metadata && metadata.status === 'generating_feedback') {
       console.log('⏳ Feedback is still being generated, returning 202 with partial data');
-      
+
       // Return partial data (interview metadata, questions, answers) without AI feedback
       // Get skill, JD, or resume information
       let skillInfo = null;
       let jdInfo = null;
       let resumeInfo = null;
       let interviewType = 'unknown';
-      
+
       if (questionBank.skillid) {
         skillInfo = await SkillName.findById(questionBank.skillid);
         interviewType = 'skill';
@@ -2048,7 +1923,7 @@ router.get('/feedback/:candidateAnsBankId', authenticateToken, async (req, res) 
       username: username,
       candidateAnsBankId: String(candidateAnsBankId)
     });
-    
+
     if (!overallFeedback) {
       console.log('⚠️  No overall feedback found for this interview');
     } else {
@@ -2060,7 +1935,7 @@ router.get('/feedback/:candidateAnsBankId', authenticateToken, async (req, res) 
     let jdInfo = null;
     let resumeInfo = null;
     let interviewType = 'unknown';
-    
+
     if (questionBank.skillid) {
       skillInfo = await SkillName.findById(questionBank.skillid);
       interviewType = 'skill';
@@ -2353,37 +2228,37 @@ router.post('/check-followup', authenticateToken, async (req, res) => {
     console.log(`\n🔍 Check Follow-up: user=${username}, qIdx=${questionIndex}, answerLen=${answer?.length || 0}`);
 
     let followUpGenerated = null;
-    
+
     // Only try to generate follow-up if we have valid data
     if (candidateAnsBankId && answer && answer.trim().length > 10) {
       try {
         // Get interview metadata
         let metadata = await InterviewMetadata.findOne({ candidateAnsBankId });
-        
+
         if (metadata && metadata.status === 'active') {
           console.log(`   Checking follow-up for question ${questionIndex}...`);
-          
+
           // Get question bank to retrieve question text
           const questionBank = await QuestionBank.findById(questionBankId);
           if (!questionBank) {
             throw new Error('Question bank not found');
           }
-          
+
           // Get candidate answer bank to retrieve all answers and track follow-ups
           const candidateAnsBank = await candidateansbank.findById(candidateAnsBankId);
           if (!candidateAnsBank) {
             throw new Error('Candidate answer bank not found');
           }
-          
+
           // Get all follow-up questions already generated for this interview
           const allFollowUps = await FollowUpQuestion.find({
             candidateAnsBankId,
           }).sort({ questionNumber: 1 });
-          
+
           // Build a complete ordered list of all questions (base + follow-ups)
           // We need to properly track which base question each position corresponds to
           const allQuestions = [];
-          
+
           // Start with base questions - use multiples of 1000 as sorting key to avoid floating point issues
           // Base questions: 0, 1000, 2000, 3000, etc.
           // Follow-ups will insert at: 1, 2, 3 (after 0), 1001, 1002 (after 1000), etc.
@@ -2395,7 +2270,7 @@ router.post('/check-followup', authenticateToken, async (req, res) => {
               baseQuestionIndex: idx, // Which base question this is
             });
           });
-          
+
           // Insert follow-up questions - they should appear right after their origin question
           // Use sortKey as: originQuestionNumber + 0.1, 0.2, etc. for proper insertion
           allFollowUps.forEach((followUp, followUpIndex) => {
@@ -2408,40 +2283,40 @@ router.post('/check-followup', authenticateToken, async (req, res) => {
               baseQuestionNumber: followUp.baseQuestionNumber, // Already stored in DB
             });
           });
-          
+
           // Sort by sortKey to get the correct interview order
           allQuestions.sort((a, b) => a.sortKey - b.sortKey);
-          
+
           // Now assign actual display indices (0, 1, 2, 3...)
           allQuestions.forEach((q, displayIndex) => {
             q.displayIndex = displayIndex;
           });
-          
+
           // Debug: Show the question mapping
-          console.log(`   📋 Question Map: ${allQuestions.map((q, i) => 
+          console.log(`   📋 Question Map: ${allQuestions.map((q, i) =>
             q.isFollowUp ? `${i}:F${q.baseQuestionNumber}` : `${i}:B${q.baseQuestionIndex}`
           ).join(', ')}`);
-          
+
           // Find the current question by matching the questionIndex (display position)
           // The questionIndex from frontend represents the actual position (0, 1, 2, 3...)
           const currentQuestionData = allQuestions.find(q => q.displayIndex === questionIndex);
-          
+
           if (!currentQuestionData) {
             console.log(`   ⚠️  Question at index ${questionIndex} not found. Skipping follow-up generation.`);
           } else {
             const currentQuestion = currentQuestionData.text;
             const isFollowUpQuestion = currentQuestionData.isFollowUp;
-            
+
             if (isFollowUpQuestion) {
               console.log(`   📌 Question ${questionIndex} is a follow-up question`);
             }
-            
+
             // Determine the base question number for this question
             let baseQuestionNumber;
             if (isFollowUpQuestion) {
               // This is a follow-up - use the baseQuestionNumber already stored in DB
               baseQuestionNumber = currentQuestionData.baseQuestionNumber;
-              
+
               // If for some reason it's not set, trace back through the parent chain
               if (baseQuestionNumber === undefined) {
                 // Find the parent follow-up in the database
@@ -2467,185 +2342,185 @@ router.post('/check-followup', authenticateToken, async (req, res) => {
               // This is a base question - use its baseQuestionIndex
               baseQuestionNumber = currentQuestionData.baseQuestionIndex;
             }
-            
+
             console.log(`   🎯 Base question for index ${questionIndex}: ${baseQuestionNumber}`);
-            
+
             // Check how many follow-ups have already been generated for this base question
             const followUpsForBaseQuestion = await FollowUpQuestion.countDocuments({
               candidateAnsBankId,
               baseQuestionNumber: baseQuestionNumber,
             });
-            
+
             const MAX_FOLLOWUPS_PER_BASE = 2;
-            
+
             if (followUpsForBaseQuestion >= MAX_FOLLOWUPS_PER_BASE) {
               console.log(`   ⏭️  Base question ${baseQuestionNumber} already has ${followUpsForBaseQuestion}/${MAX_FOLLOWUPS_PER_BASE} follow-ups. Skipping.`);
               metadata.followupRejectionCount += 1;
             } else {
               console.log(`   ✅ Base question ${baseQuestionNumber} has ${followUpsForBaseQuestion}/${MAX_FOLLOWUPS_PER_BASE} follow-ups. Can generate more.`);
-            
+
               // Check if we've already generated a follow-up for this specific question
               // Use the actual display index to check for duplicates
               const existingFollowUpForThisQuestion = await FollowUpQuestion.findOne({
                 candidateAnsBankId,
                 originQuestionNumber: questionIndex,
               });
-              
+
               if (existingFollowUpForThisQuestion) {
                 console.log(`   ⏭️  Already generated follow-up for question ${questionIndex}. Skipping to prevent loop.`);
                 metadata.followupRejectionCount += 1;
               } else {
 
-            // Build previous Q&A pairs for context by iterating the full ordered list (allQuestions)
-            const previousQAPairs = [];
-            for (const q of allQuestions) {
-              if (typeof q.displayIndex !== 'number') continue;
-              if (q.displayIndex >= questionIndex) break; // only previous
-              const ans = (candidateAnsBank.ansArray && candidateAnsBank.ansArray[q.displayIndex]) || '';
-              previousQAPairs.push({
-                question: q.text,
-                answer: ans,
-                isFollowUp: !!q.isFollowUp,
-                questionNumber: q.displayIndex,
-              });
-            }
-            
-            // Run follow-up detector
-            const detectorResult = await detectFollowUpNeed(
-              previousQAPairs,
-              currentQuestion,
-              answer
-            );
-            
-            console.log(`   Detector: need=${detectorResult.need_follow_up}, conf=${detectorResult.confidence.toFixed(2)}, reason="${detectorResult.reason}"`);
-            
-            // Store the summarized answer for later use in feedback generation
-            if (detectorResult.summarized_answer && candidateAnsBankId) {
-              try {
-                const cand = await candidateansbank.findById(candidateAnsBankId);
-                if (cand) {
-                  // Initialize summarizedAnsArray if it doesn't exist
-                  if (!cand.summarizedAnsArray) {
-                    cand.summarizedAnsArray = [];
-                  }
-                  cand.summarizedAnsArray[questionIndex] = detectorResult.summarized_answer;
-                  await cand.save();
-                  console.log(`   ✅ Summarized answer saved (tokens reduced)`);
+                // Build previous Q&A pairs for context by iterating the full ordered list (allQuestions)
+                const previousQAPairs = [];
+                for (const q of allQuestions) {
+                  if (typeof q.displayIndex !== 'number') continue;
+                  if (q.displayIndex >= questionIndex) break; // only previous
+                  const ans = (candidateAnsBank.ansArray && candidateAnsBank.ansArray[q.displayIndex]) || '';
+                  previousQAPairs.push({
+                    question: q.text,
+                    answer: ans,
+                    isFollowUp: !!q.isFollowUp,
+                    questionNumber: q.displayIndex,
+                  });
                 }
-              } catch (saveError) {
-                console.error('❌ Error saving summarized answer:', saveError.message);
-              }
-            }
-            
-            // Update metadata with detector stats
-            metadata.detectorCallCount += 1;
-            metadata.avgDetectorConfidence = 
-              (metadata.avgDetectorConfidence * (metadata.detectorCallCount - 1) + detectorResult.confidence) / metadata.detectorCallCount;
-            
-            // Check heuristics to see if we should actually generate the follow-up
-            if (detectorResult.need_follow_up) {
-              const heuristicCheck = checkFollowUpHeuristics(
-                metadata,
-                questionIndex,
-                detectorResult.confidence
-              );
-              
-              console.log(`   Heuristics: allowed=${heuristicCheck.allowed}, reason="${heuristicCheck.reason}"`);
-              
-              if (heuristicCheck.allowed) {
-                // Generate follow-up question
-                console.log(`   ✨ Generating follow-up question...`);
-                
-                const generatorResult = await generateFollowUpQuestion(
+
+                // Run follow-up detector
+                const detectorResult = await detectFollowUpNeed(
                   previousQAPairs,
                   currentQuestion,
-                  answer,
-                  detectorResult.reason
+                  answer
                 );
-                
-                console.log(`   Generated: "${generatorResult.follow_up_question}"`);
-                
-                // Calculate the next question number for dynamic insertion
-                // We need to insert this follow-up IMMEDIATELY after the current question
-                // Use integer-based sortKey to avoid floating point precision issues
-                // Base questions: 0, 1000, 2000, 3000 (multiples of 1000)
-                // Follow-ups: parent + 1, parent + 2, parent + 3, etc.
-                
-                // Find the current question's sortKey
-                const currentSortKey = currentQuestionData.sortKey;
-                
-                // Count how many follow-ups already exist for this specific question
-                const followUpsAfterCurrent = await FollowUpQuestion.countDocuments({
-                  candidateAnsBankId,
-                  originQuestionNumber: questionIndex,
-                });
-                
-                // Use integer increment: currentSortKey + 1, +2, +3, etc.
-                // This ensures follow-ups appear right after the question that triggered them
-                const newSortKey = currentSortKey + (followUpsAfterCurrent + 1);
-                
-                console.log(`   📍 Inserting at sortKey ${newSortKey} (after current sortKey ${currentSortKey})`);
-                
-                // Create and save the follow-up question (handle potential duplicate key due to race)
-                let followUpDoc;
-                try {
-                  followUpDoc = await FollowUpQuestion.create({
-                    username,
-                    candidateAnsBankId,
-                    interviewId: metadata.interviewId,
-                    originQuestionId: questionBankId,
-                    originQuestionNumber: questionIndex,
-                    baseQuestionNumber: baseQuestionNumber, // Track the ultimate base question
-                    questionNumber: newSortKey, // Use integer sortKey for proper ordering
-                    generatedQuestionText: generatorResult.follow_up_question,
-                    expectedAnswerText: generatorResult.expected_answer,
-                    detectorConfidence: detectorResult.confidence,
-                    detectorReason: detectorResult.reason,
-                    status: 'pending',
-                    timestampGenerated: new Date(),
-                  });
-                  console.log(`   ✅ Follow-up saved: ID=${followUpDoc._id}, sortKey=${newSortKey}, base=${baseQuestionNumber}`);
-                } catch (createErr) {
-                  // Duplicate key - fetch existing doc and continue
-                  if (createErr && createErr.code === 11000) {
-                    console.warn('   ⚠️ Duplicate follow-up detected (likely race). Loading existing follow-up');
-                    followUpDoc = await FollowUpQuestion.findOne({ candidateAnsBankId, originQuestionNumber: questionIndex });
-                    if (followUpDoc) {
-                      console.log(`   ✅ Existing follow-up loaded: ID=${followUpDoc._id}`);
+
+                console.log(`   Detector: need=${detectorResult.need_follow_up}, conf=${detectorResult.confidence.toFixed(2)}, reason="${detectorResult.reason}"`);
+
+                // Store the summarized answer for later use in feedback generation
+                if (detectorResult.summarized_answer && candidateAnsBankId) {
+                  try {
+                    const cand = await candidateansbank.findById(candidateAnsBankId);
+                    if (cand) {
+                      // Initialize summarizedAnsArray if it doesn't exist
+                      if (!cand.summarizedAnsArray) {
+                        cand.summarizedAnsArray = [];
+                      }
+                      cand.summarizedAnsArray[questionIndex] = detectorResult.summarized_answer;
+                      await cand.save();
+                      console.log(`   ✅ Summarized answer saved (tokens reduced)`);
                     }
-                  } else {
-                    throw createErr;
+                  } catch (saveError) {
+                    console.error('❌ Error saving summarized answer:', saveError.message);
                   }
                 }
-                
-                // Update metadata
-                metadata.followupCount += 1;
-                metadata.currentTotalQuestions += 1;
-                metadata.lastFollowupPosition = questionIndex;
-                metadata.followupApprovalCount += 1;
-                
-                // NO COOLDOWN BLOCKING - allow follow-ups on any question
-                
-                followUpGenerated = {
-                  followUpId: followUpDoc._id.toString(),
-                  question: generatorResult.follow_up_question,
-                  questionNumber: questionIndex + 1, // Frontend expects next display position
-                  insertAfter: questionIndex, // 0-based index where to insert (right after current)
-                };
-              } else {
-                // Heuristics rejected
-                metadata.followupRejectionCount += 1;
-              }
-            } else {
-              // Detector said no follow-up needed
-              metadata.followupRejectionCount += 1;
-            }
-            } // Close else block for existingFollowUpForThisQuestion check
+
+                // Update metadata with detector stats
+                metadata.detectorCallCount += 1;
+                metadata.avgDetectorConfidence =
+                  (metadata.avgDetectorConfidence * (metadata.detectorCallCount - 1) + detectorResult.confidence) / metadata.detectorCallCount;
+
+                // Check heuristics to see if we should actually generate the follow-up
+                if (detectorResult.need_follow_up) {
+                  const heuristicCheck = checkFollowUpHeuristics(
+                    metadata,
+                    questionIndex,
+                    detectorResult.confidence
+                  );
+
+                  console.log(`   Heuristics: allowed=${heuristicCheck.allowed}, reason="${heuristicCheck.reason}"`);
+
+                  if (heuristicCheck.allowed) {
+                    // Generate follow-up question
+                    console.log(`   ✨ Generating follow-up question...`);
+
+                    const generatorResult = await generateFollowUpQuestion(
+                      previousQAPairs,
+                      currentQuestion,
+                      answer,
+                      detectorResult.reason
+                    );
+
+                    console.log(`   Generated: "${generatorResult.follow_up_question}"`);
+
+                    // Calculate the next question number for dynamic insertion
+                    // We need to insert this follow-up IMMEDIATELY after the current question
+                    // Use integer-based sortKey to avoid floating point precision issues
+                    // Base questions: 0, 1000, 2000, 3000 (multiples of 1000)
+                    // Follow-ups: parent + 1, parent + 2, parent + 3, etc.
+
+                    // Find the current question's sortKey
+                    const currentSortKey = currentQuestionData.sortKey;
+
+                    // Count how many follow-ups already exist for this specific question
+                    const followUpsAfterCurrent = await FollowUpQuestion.countDocuments({
+                      candidateAnsBankId,
+                      originQuestionNumber: questionIndex,
+                    });
+
+                    // Use integer increment: currentSortKey + 1, +2, +3, etc.
+                    // This ensures follow-ups appear right after the question that triggered them
+                    const newSortKey = currentSortKey + (followUpsAfterCurrent + 1);
+
+                    console.log(`   📍 Inserting at sortKey ${newSortKey} (after current sortKey ${currentSortKey})`);
+
+                    // Create and save the follow-up question (handle potential duplicate key due to race)
+                    let followUpDoc;
+                    try {
+                      followUpDoc = await FollowUpQuestion.create({
+                        username,
+                        candidateAnsBankId,
+                        interviewId: metadata.interviewId,
+                        originQuestionId: questionBankId,
+                        originQuestionNumber: questionIndex,
+                        baseQuestionNumber: baseQuestionNumber, // Track the ultimate base question
+                        questionNumber: newSortKey, // Use integer sortKey for proper ordering
+                        generatedQuestionText: generatorResult.follow_up_question,
+                        expectedAnswerText: generatorResult.expected_answer,
+                        detectorConfidence: detectorResult.confidence,
+                        detectorReason: detectorResult.reason,
+                        status: 'pending',
+                        timestampGenerated: new Date(),
+                      });
+                      console.log(`   ✅ Follow-up saved: ID=${followUpDoc._id}, sortKey=${newSortKey}, base=${baseQuestionNumber}`);
+                    } catch (createErr) {
+                      // Duplicate key - fetch existing doc and continue
+                      if (createErr && createErr.code === 11000) {
+                        console.warn('   ⚠️ Duplicate follow-up detected (likely race). Loading existing follow-up');
+                        followUpDoc = await FollowUpQuestion.findOne({ candidateAnsBankId, originQuestionNumber: questionIndex });
+                        if (followUpDoc) {
+                          console.log(`   ✅ Existing follow-up loaded: ID=${followUpDoc._id}`);
+                        }
+                      } else {
+                        throw createErr;
+                      }
+                    }
+
+                    // Update metadata
+                    metadata.followupCount += 1;
+                    metadata.currentTotalQuestions += 1;
+                    metadata.lastFollowupPosition = questionIndex;
+                    metadata.followupApprovalCount += 1;
+
+                    // NO COOLDOWN BLOCKING - allow follow-ups on any question
+
+                    followUpGenerated = {
+                      followUpId: followUpDoc._id.toString(),
+                      question: generatorResult.follow_up_question,
+                      questionNumber: questionIndex + 1, // Frontend expects next display position
+                      insertAfter: questionIndex, // 0-based index where to insert (right after current)
+                    };
+                  } else {
+                    // Heuristics rejected
+                    metadata.followupRejectionCount += 1;
+                  }
+                } else {
+                  // Detector said no follow-up needed
+                  metadata.followupRejectionCount += 1;
+                }
+              } // Close else block for existingFollowUpForThisQuestion check
             } // Close else block for followUpsForBaseQuestion < MAX check
-            
+
             // Update total questions answered
             metadata.totalQuestionsAnswered = Math.max(metadata.totalQuestionsAnswered, questionIndex + 1);
-            
+
             await metadata.save();
           } // Close else block for currentQuestionData check
         }
@@ -2670,7 +2545,7 @@ router.post('/check-followup', authenticateToken, async (req, res) => {
       }
     }
 
-    res.json({ 
+    res.json({
       success: true,
       followUp: followUpGenerated, // Will be null if no follow-up was generated
     });
@@ -2688,8 +2563,8 @@ router.post('/violation/start', authenticateToken, async (req, res) => {
 
     // Try to update existing session with atomic operation
     const result = await ExamSession.findOneAndUpdate(
-      { 
-        username, 
+      {
+        username,
         questionBankId,
         'violations.id': id // Check if violation already exists
       },
@@ -2700,23 +2575,23 @@ router.post('/violation/start', authenticateToken, async (req, res) => {
           last_ping: new Date()
         }
       },
-      { 
+      {
         sort: { createdAt: -1 },
-        new: true 
+        new: true
       }
     );
 
     // If violation doesn't exist, add it
     if (!result) {
       const session = await ExamSession.findOne({ username, questionBankId }).sort({ createdAt: -1 });
-      
+
       if (!session) {
         // Create new session
-        await ExamSession.create({ 
-          username, 
-          questionBankId, 
-          candidateAnsBankId, 
-          start_time: new Date(), 
+        await ExamSession.create({
+          username,
+          questionBankId,
+          candidateAnsBankId,
+          start_time: new Date(),
           last_ping: new Date(),
           violations: [{ id, reason, ts: ts ? new Date(ts) : new Date() }]
         });
@@ -2752,8 +2627,8 @@ router.post('/violation/commit', authenticateToken, async (req, res) => {
 
     // Use atomic update to avoid version conflicts
     const result = await ExamSession.findOneAndUpdate(
-      { 
-        username, 
+      {
+        username,
         questionBankId,
         'violations.id': id,
         'violations.committedAt': { $exists: false } // Only update if not already committed
@@ -2765,9 +2640,9 @@ router.post('/violation/commit', authenticateToken, async (req, res) => {
           last_ping: new Date()
         }
       },
-      { 
+      {
         sort: { createdAt: -1 },
-        new: true 
+        new: true
       }
     );
 
@@ -2808,8 +2683,8 @@ router.post('/violation/resolved', authenticateToken, async (req, res) => {
 
     // Use atomic update to avoid version conflicts
     const result = await ExamSession.findOneAndUpdate(
-      { 
-        username, 
+      {
+        username,
         questionBankId,
         'violations.id': id,
         'violations.resolvedAt': { $exists: false } // Only update if not already resolved
@@ -2820,9 +2695,9 @@ router.post('/violation/resolved', authenticateToken, async (req, res) => {
           last_ping: new Date()
         }
       },
-      { 
+      {
         sort: { createdAt: -1 },
-        new: true 
+        new: true
       }
     );
 
@@ -2841,11 +2716,11 @@ router.post('/client-disconnect', async (req, res) => {
     const { candidateAnsBankId, questionBankId, ts, username } = req.body;
 
     // Try to find session by questionBankId (most recent active one)
-    const session = await ExamSession.findOne({ 
-      questionBankId, 
-      status: { $in: ['active', 'review'] } 
+    const session = await ExamSession.findOne({
+      questionBankId,
+      status: { $in: ['active', 'review'] }
     }).sort({ createdAt: -1 });
-    
+
     if (session) {
       session.status = 'disconnected';
       session.last_ping = ts ? new Date(ts) : new Date();
@@ -2865,7 +2740,7 @@ router.post('/save-visual', authenticateToken, async (req, res) => {
     const { candidateAnsBankId, visualData } = req.body;
     const username = req.user.username;
 
-   
+
     // Validation
     if (!candidateAnsBankId || !visualData) {
       console.log('❌ Missing candidateAnsBankId or visualData');
@@ -2877,7 +2752,7 @@ router.post('/save-visual', authenticateToken, async (req, res) => {
 
     // Find candidate answer bank
     const candidateAns = await candidateansbank.findById(candidateAnsBankId);
-    
+
     if (!candidateAns) {
       console.log('❌ Candidate answer bank not found');
       return res.status(404).json({

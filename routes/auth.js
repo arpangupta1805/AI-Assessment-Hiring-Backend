@@ -446,21 +446,19 @@ router.get('/me', authenticateToken, async (req, res) => {
     res.json({
       success: true,
       data: {
-        user: {
-          id: user._id,
-          email: user.email,
-          username: user.username,
-          name: user.name,
-          role: user.role,
-          isEmailVerified: user.isEmailVerified,
-          profileImageUrl: user.profileImageUrl,
-          webcamPhoto: user.webcamPhoto,
-          consentAccepted: user.consentAccepted,
-          company: user.company ? {
-            id: user.company._id,
-            name: user.company.name,
-          } : null,
-        },
+        id: user._id,
+        email: user.email,
+        username: user.username,
+        name: user.name,
+        role: user.role,
+        isEmailVerified: user.isEmailVerified,
+        profileImageUrl: user.profileImageUrl,
+        webcamPhoto: user.webcamPhoto,
+        consentAccepted: user.consentAccepted,
+        company: user.company ? {
+          id: user.company._id,
+          name: user.company.name,
+        } : null,
       },
     });
   } catch (error) {
@@ -468,6 +466,127 @@ router.get('/me', authenticateToken, async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to get user info',
+    });
+  }
+});
+
+// ============================================================================
+// PROFILE MANAGEMENT
+// ============================================================================
+
+/**
+ * PUT /api/auth/profile
+ * Update user profile
+ */
+router.put('/profile', authenticateToken, [
+  body('name').optional().trim().notEmpty().withMessage('Name cannot be empty'),
+  body('username').optional().trim().isLength({ min: 3, max: 20 }).withMessage('Username must be 3-20 characters'),
+  body('companyName').optional().trim().notEmpty().withMessage('Company name cannot be empty'),
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    const { name, username, companyName } = req.body;
+    const user = await User.findById(req.user._id).populate('company');
+
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    // Update user fields
+    if (name) user.name = name;
+
+    // Candidates can update username
+    if (username && user.role === 'candidate') {
+      // Check if username is taken
+      const existingUser = await User.findOne({ username, _id: { $ne: user._id } });
+      if (existingUser) {
+        return res.status(400).json({ success: false, error: 'Username already taken' });
+      }
+      user.username = username;
+    }
+
+    await user.save();
+
+    // Update company name for recruiters
+    if (companyName && user.role === 'recruiter' && user.company) {
+      await Company.findByIdAndUpdate(user.company._id, { name: companyName });
+    }
+
+    const updatedUser = await User.findById(user._id).select('-password').populate('company');
+
+    res.json({
+      success: true,
+      message: 'Profile updated successfully',
+      data: {
+        id: updatedUser._id,
+        email: updatedUser.email,
+        username: updatedUser.username,
+        name: updatedUser.name,
+        role: updatedUser.role,
+        company: updatedUser.company ? {
+          id: updatedUser.company._id,
+          name: updatedUser.company.name,
+        } : null,
+      },
+    });
+  } catch (error) {
+    console.error('❌ Profile update error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update profile',
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * POST /api/auth/change-password
+ * Change user password
+ */
+router.post('/change-password', authenticateToken, [
+  body('currentPassword').notEmpty().withMessage('Current password is required'),
+  body('newPassword').isLength({ min: 6 }).withMessage('New password must be at least 6 characters'),
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    const { currentPassword, newPassword } = req.body;
+
+    // Get user with password
+    const user = await User.findById(req.user._id).select('+password');
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    // Verify current password
+    const isPasswordValid = await user.comparePassword(currentPassword);
+    if (!isPasswordValid) {
+      return res.status(400).json({ success: false, error: 'Current password is incorrect' });
+    }
+
+    // Update password
+    user.password = newPassword;
+    await user.save();
+
+    console.log(`✅ Password changed for user: ${user.email}`);
+
+    res.json({
+      success: true,
+      message: 'Password changed successfully',
+    });
+  } catch (error) {
+    console.error('❌ Password change error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to change password',
+      message: error.message,
     });
   }
 });

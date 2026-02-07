@@ -146,7 +146,7 @@ const EvaluationSchema = new mongoose.Schema(
         // Admin decision (final, human-controlled)
         adminDecision: {
             type: String,
-            enum: ['PASS', 'FAIL', 'HOLD', 'REVIEW_PENDING'],
+            enum: ['PASS', 'FAIL', 'HOLD', 'CHEATING', 'REVIEW_PENDING'],
             default: 'REVIEW_PENDING',
         },
         adminDecisionBy: {
@@ -203,7 +203,8 @@ const EvaluationSchema = new mongoose.Schema(
 );
 
 // Indexes
-EvaluationSchema.index({ candidateAssessment: 1 });
+// The 'candidateAssessment' field has unique: true, which automatically creates a unique index.
+// The other indexes are not redundant.
 EvaluationSchema.index({ aiRecommendation: 1 });
 EvaluationSchema.index({ adminDecision: 1 });
 EvaluationSchema.index({ 'plagiarism.isFlagged': 1 });
@@ -211,17 +212,33 @@ EvaluationSchema.index({ 'plagiarism.isFlagged': 1 });
 // Calculate weighted score based on section weights
 EvaluationSchema.methods.calculateWeightedScore = function (sectionWeights) {
     const { objective, subjective, programming } = this.sections;
-    const weights = sectionWeights || { objective: 30, subjective: 30, programming: 40 };
+
+    // Handle if sectionWeights passes objects with .weight property (from JD schema) or just numbers
+    const getWeight = (key) => {
+        if (!sectionWeights || !sectionWeights[key]) return 0;
+        if (typeof sectionWeights[key] === 'number') return sectionWeights[key];
+        if (typeof sectionWeights[key].weight === 'number') return sectionWeights[key].weight;
+        return 0;
+    };
+
+    const wObj = sectionWeights ? getWeight('objective') : 30;
+    const wSub = sectionWeights ? getWeight('subjective') : 30;
+    const wProg = sectionWeights ? getWeight('programming') : 40;
 
     const objPercent = objective.maxScore > 0 ? (objective.score / objective.maxScore) * 100 : 0;
     const subPercent = subjective.maxScore > 0 ? (subjective.score / subjective.maxScore) * 100 : 0;
     const progPercent = programming.maxScore > 0 ? (programming.score / programming.maxScore) * 100 : 0;
 
     this.weightedScore = (
-        (objPercent * weights.objective / 100) +
-        (subPercent * weights.subjective / 100) +
-        (progPercent * weights.programming / 100)
+        (objPercent * wObj / 100) +
+        (subPercent * wSub / 100) +
+        (progPercent * wProg / 100)
     );
+
+    // Safeguard against NaN
+    if (isNaN(this.weightedScore)) {
+        this.weightedScore = 0;
+    }
 
     return this.weightedScore;
 };

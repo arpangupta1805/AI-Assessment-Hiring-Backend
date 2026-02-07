@@ -1,61 +1,13 @@
 // Follow-up Question Detection and Generation Services
 // Phase 2: Adaptive, context-aware follow-up questions
 
-// Helper function to call Gemini API with retry logic
-const callGeminiWithRetry = async (prompt, maxRetries = 3, temperature = 0.7, modelName = null) => {
-  const model = modelName || process.env.GEMINI_MODEL || "gemini-2.0-flash";
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: temperature,
-            maxOutputTokens: 1024,
-          },
-        }),
-      });
-
-      if (response.status === 429) {
-        const retryAfter = response.headers.get('retry-after');
-        const delay = retryAfter 
-          ? parseInt(retryAfter) * 1000 
-          : Math.pow(2, attempt) * 5000; // Exponential backoff: 5s, 10s, 20s (more conservative for rate limits)
-        
-        console.log(`⚠️  Rate limited. Retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})...`);
-        
-        if (attempt < maxRetries - 1) {
-          await new Promise(resolve => setTimeout(resolve, delay));
-          continue;
-        } else {
-          throw new Error('Gemini API rate limit exceeded');
-        }
-      }
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Gemini API error (${response.status}): ${errorText}`);
-      }
-
-      return await response.json();
-    } catch (error) {
-      if (attempt === maxRetries - 1 || error.message.includes('rate limit')) {
-        throw error;
-      }
-      
-      const delay = Math.pow(2, attempt) * 5000; // 5s, 10s, 20s (more conservative)
-      console.log(`⚠️  Gemini API error: ${error.message}. Retrying in ${delay}ms...`);
-      await new Promise(resolve => setTimeout(resolve, delay));
-    }
-  }
-};
+import { callOpenAI } from '../lib/openai.js';
 
 // Helper: extract first balanced JSON object from text by tracking brace depth
+// (Kept as fallback/utility, though callOpenAI handles most cases)
 export const extractFirstBalancedJSON = (text) => {
+
   if (!text || typeof text !== 'string') return null;
   const start = text.indexOf('{');
   if (start === -1) return null;
@@ -107,13 +59,13 @@ const isDuplicateQuestion = (candidate, previousQAPairs) => {
  */
 export const detectFollowUpNeed = async (previousQAPairs, currentQuestion, currentAnswer) => {
   const startTime = Date.now();
-  
+
   try {
     // Build context from previous Q&A pairs
     const contextText = previousQAPairs.length > 0
-      ? previousQAPairs.map((qa, idx) => 
-          `Q${idx + 1}: ${qa.question}\nA${idx + 1}: ${qa.answer}`
-        ).join('\n\n')
+      ? previousQAPairs.map((qa, idx) =>
+        `Q${idx + 1}: ${qa.question}\nA${idx + 1}: ${qa.answer}`
+      ).join('\n\n')
       : 'No previous questions in this interview.';
 
     const prompt = `You are an expert interviewer analyzer. Your task is to determine if a follow-up question is needed based on a candidate's answer.
@@ -172,34 +124,19 @@ Analyze the candidate's answer to the current question. You need to do TWO thing
 Return ONLY the JSON object, no additional text or markdown.`;
 
     // Use low temperature for more deterministic, conservative decisions
-    const data = await callGeminiWithRetry(prompt, 3, 0.3, process.env.SMALLER_MODEL); // Fast, small model
-    
-    const aiResponse = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    
-    // Try robust extraction of first balanced JSON
-    let result = extractFirstBalancedJSON(aiResponse);
-    if (!result) {
-      // Fallback to regex fallback (existing) but still sanitize
-      const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        try { result = JSON.parse(jsonMatch[0]); } catch (e) { result = null; }
-      }
-    }
+    // callOpenAI returns parsed object when jsonMode is true
+    const result = await callOpenAI(prompt, process.env.SMALLER_MODEL || 'gpt-4o', true);
 
-    if (!result) {
-      console.error('Failed to parse detector response (raw):', aiResponse);
-      throw new Error('Failed to parse detector response');
-    }
 
     // Ensure confidence is a number between 0 and 1
     result.confidence = Math.max(0, Math.min(1, parseFloat(result.confidence) || 0));
-    
+
     // Ensure summarized_answer exists, fallback to original answer if not provided
     const summarizedAnswer = result.summarized_answer || result.summarizedAnswer || currentAnswer;
-    
+
     const latency = Date.now() - startTime;
     console.log(`🔍 Detector: need_follow_up=${result.need_follow_up}, confidence=${result.confidence.toFixed(2)}, latency=${latency}ms`);
-    
+
     return {
       need_follow_up: Boolean(result.need_follow_up),
       confidence: result.confidence,
@@ -209,7 +146,7 @@ Return ONLY the JSON object, no additional text or markdown.`;
     };
   } catch (error) {
     console.error('❌ Error in follow-up detector:', error);
-    
+
     // Return conservative default on error (use original answer as fallback)
     return {
       need_follow_up: false,
@@ -223,7 +160,7 @@ Return ONLY the JSON object, no additional text or markdown.`;
 
 /**
  * Follow-up Question Generator
- * Uses Gemini 2.0 Flash to generate a contextual follow-up question
+ * Uses OpenAI to generate a contextual follow-up question
  * 
  * @param {Array} previousQAPairs - Array of {question, answer} objects  
  * @param {String} currentQuestion - The current question text
@@ -233,13 +170,13 @@ Return ONLY the JSON object, no additional text or markdown.`;
  */
 export const generateFollowUpQuestion = async (previousQAPairs, currentQuestion, currentAnswer, detectorReason) => {
   const startTime = Date.now();
-  
+
   try {
     // Build context from previous Q&A pairs (for avoiding repetition)
     const contextText = previousQAPairs.length > 0
-      ? previousQAPairs.map((qa, idx) => 
-          `Q${idx + 1}: ${qa.question}\nA${idx + 1}: ${qa.answer}`
-        ).join('\n\n')
+      ? previousQAPairs.map((qa, idx) =>
+        `Q${idx + 1}: ${qa.question}\nA${idx + 1}: ${qa.answer}`
+      ).join('\n\n')
       : 'No previous questions in this interview.';
 
     const prompt = `You are an expert technical interviewer. Generate a single, focused follow-up question based on the candidate's recent answer.
@@ -280,23 +217,9 @@ Create ONE concise, probing follow-up question that:
 
 Return ONLY the JSON object, no additional text or markdown.`;
 
-    const data = await callGeminiWithRetry(prompt, 3, 0.7, 'gemini-2.0-flash'); // Large, capable model
-    
-    const aiResponse = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    
-    // Robust parse
-    let result = extractFirstBalancedJSON(aiResponse);
-    if (!result) {
-      const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        try { result = JSON.parse(jsonMatch[0]); } catch (e) { result = null; }
-      }
-    }
+    // callOpenAI with jsonMode=true
+    const result = await callOpenAI(prompt, 'gpt-4o', true);
 
-    if (!result) {
-      console.error('Failed to parse generator response (raw):', aiResponse);
-      throw new Error('Failed to parse generator response');
-    }
 
     // Normalize fields
     let followUpQuestion = sanitizeString(result.follow_up_question || result.followUpQuestion || 'Can you elaborate on that?', 500);
@@ -306,18 +229,16 @@ Return ONLY the JSON object, no additional text or markdown.`;
     if (isDuplicateQuestion(followUpQuestion, previousQAPairs)) {
       console.log('   ⚠️ Generator produced duplicate question; retrying once with stricter prompt');
       const retryPrompt = prompt + '\n\nPlease ensure the follow-up question is NOT a repeat of previous questions and is more specific.';
-      const retryData = await callGeminiWithRetry(retryPrompt, 1, 0.7, 'gemini-2.0-flash');
-  const retryText = retryData?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      let retryResult = extractFirstBalancedJSON(retryText);
-      if (!retryResult) {
-        const jsonMatch = retryText.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          try { retryResult = JSON.parse(jsonMatch[0]); } catch (e) { retryResult = null; }
+
+      try {
+        const retryResult = await callOpenAI(retryPrompt, 'gpt-4o', true, 1);
+
+        if (retryResult) {
+          followUpQuestion = sanitizeString(retryResult.follow_up_question || retryResult.followUpQuestion || followUpQuestion, 500);
+          expectedAnswer = sanitizeString(retryResult.expected_answer || retryResult.expectedAnswer || expectedAnswer, 2000);
         }
-      }
-      if (retryResult) {
-        followUpQuestion = sanitizeString(retryResult.follow_up_question || retryResult.followUpQuestion || followUpQuestion, 500);
-        expectedAnswer = sanitizeString(retryResult.expected_answer || retryResult.expectedAnswer || expectedAnswer, 2000);
+      } catch (retryError) {
+        console.error('Error in retry generation:', retryError);
       }
     }
 
@@ -347,29 +268,29 @@ export const checkFollowUpHeuristics = (metadata, currentQuestionNumber, detecto
   // BALANCED DISTRIBUTION STRATEGY
   // Goal: ~1.5x follow-ups per base question, distributed throughout interview
   // Example: 3 base questions, max 10 total → target 6-7 follow-ups (1.5 * 3 = 4.5, rounded up)
-  
+
   const baseQuestionsCount = metadata.baseQuestionCount; // Original number of base questions (FIXED: was questionCount)
   const targetTotalQuestions = metadata.maxQuestions; // Max questions allowed
   const currentTotal = metadata.currentTotalQuestions; // Current total (base + follow-ups generated)
   const followupsGenerated = metadata.followupCount; // Follow-ups generated so far
-  
+
   // Calculate target follow-ups: 1.5x base questions, but capped by maxQuestions
   const targetFollowups = Math.min(
     Math.ceil(baseQuestionsCount * 1.5),
     targetTotalQuestions - baseQuestionsCount
   );
-  
+
   // How many base questions are left to ask (after current one)
   const baseQuestionsRemaining = baseQuestionsCount - currentQuestionNumber - 1;
-  
+
   // Calculate ideal follow-ups remaining to reach target
   const idealFollowupsRemaining = targetFollowups - followupsGenerated;
-  
+
   // Calculate available slots (max total - current total - base questions remaining)
   const availableSlots = Math.max(0, targetTotalQuestions - currentTotal - Math.max(0, baseQuestionsRemaining));
-  
+
   console.log(`   📊 Follow-up Budget: generated=${followupsGenerated}/${targetFollowups} target, baseRemaining=${baseQuestionsRemaining}, availableSlots=${availableSlots}`);
-  
+
   // Check 1: STRICT confidence threshold - ALWAYS require 0.65+
   const CONFIDENCE_THRESHOLD = 0.65;
   if (detectorConfidence < CONFIDENCE_THRESHOLD) {
@@ -378,7 +299,7 @@ export const checkFollowUpHeuristics = (metadata, currentQuestionNumber, detecto
       reason: `Confidence ${detectorConfidence.toFixed(2)} below threshold ${CONFIDENCE_THRESHOLD}`,
     };
   }
-  
+
   // Check 2: Max questions limit - MUST NOT EXCEED
   if (currentTotal >= targetTotalQuestions) {
     return {
@@ -386,7 +307,7 @@ export const checkFollowUpHeuristics = (metadata, currentQuestionNumber, detecto
       reason: `Max questions limit reached (${targetTotalQuestions})`,
     };
   }
-  
+
   // Check 3: Don't generate if we'd run out of slots for remaining base questions
   if (availableSlots < 1) {
     return {
@@ -394,7 +315,7 @@ export const checkFollowUpHeuristics = (metadata, currentQuestionNumber, detecto
       reason: `No available slots: need space for ${baseQuestionsRemaining} base questions`,
     };
   }
-  
+
   // Check 4: Smart distribution - check if we should generate based on remaining budget
   // Allow if we're below target OR if we have room and good answers warrant follow-ups
   if (followupsGenerated >= targetFollowups) {
@@ -415,15 +336,15 @@ export const checkFollowUpHeuristics = (metadata, currentQuestionNumber, detecto
   }
 
   // NO COOLDOWN/BLOCKING CHECKS - allow follow-ups on any question
-  
+
   // Calculate how on-pace we are
   const paceRatio = (currentQuestionNumber + 1) > 0 ? followupsGenerated / (currentQuestionNumber + 1) : 0;
   const targetPaceRatio = baseQuestionsCount > 0 ? targetFollowups / baseQuestionsCount : 0;
-  
+
   let reason = 'All heuristics passed';
   if (followupsGenerated < targetFollowups) {
     const behind = paceRatio < targetPaceRatio * 0.8;
-    reason = behind 
+    reason = behind
       ? `Behind pace: generating to reach ${targetFollowups} target (${followupsGenerated} so far)`
       : `On pace: ${followupsGenerated}/${targetFollowups} target`;
   }

@@ -6,6 +6,9 @@
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const pdf = require('pdf-parse');
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -166,15 +169,24 @@ export const extractResumeText = async (filepath) => {
         // For now, only handle .txt files directly
         // For PDF/DOC, you'd need additional libraries like pdf-parse or mammoth
         if (ext === '.txt') {
-            const fullPath = filepath.startsWith('/uploads/')
-                ? path.join(__dirname, '..', filepath)
-                : filepath;
-            const text = await fs.promises.readFile(fullPath, 'utf-8');
-            return text;
+            const fullPath = filepath.startsWith('/uploads/') ? path.join(__dirname, '..', filepath) : filepath;
+            if (fs.existsSync(fullPath)) {
+                return await fs.promises.readFile(fullPath, 'utf-8');
+            }
+        } else if (ext === '.pdf') {
+            try {
+                const fullPath = filepath.startsWith('/uploads/') ? path.join(__dirname, '..', filepath) : filepath;
+                if (fs.existsSync(fullPath)) {
+                    const dataBuffer = await fs.promises.readFile(fullPath);
+                    // Standard pdf-parse v1.1.1 usage
+                    const pdfData = await pdf(dataBuffer);
+                    return pdfData.text;
+                }
+            } catch (pdfError) {
+                console.error('❌ PDF parsing error:', pdfError);
+            }
         }
 
-        // For PDF/DOC, return empty - frontend should send parsed text
-        // Or integrate pdf-parse/mammoth here
         console.log(`⚠️ Cannot extract text from ${ext} file. Text should be provided by frontend.`);
         return '';
     } catch (error) {

@@ -1,4 +1,8 @@
+
+import { callOpenAI } from '../lib/openai.js';
+
 class OAScoringService {
+
     constructor() {
         // Scoring weights
         this.weights = {
@@ -26,64 +30,8 @@ class OAScoringService {
         };
     }
 
-    /**
-     * Helper function to call Gemini API with retry logic
-     */
-    async callGemini(prompt, modelName = null, temperature = 0.7, maxRetries = 3) {
-        const model = modelName || process.env.GEMINI_MODEL || 'gemini-2.0-flash';
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
-        for (let attempt = 0; attempt < maxRetries; attempt++) {
-            try {
-                console.log(`📡 Calling Gemini API (attempt ${attempt + 1}/${maxRetries})...`);
-                console.log(`📡 Model: ${model}`);
-                console.log(`📡 Prompt length: ${prompt.length} chars`);
-                
-                const response = await fetch(url, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        contents: [{ parts: [{ text: prompt }] }],
-                        generationConfig: {
-                            temperature: temperature,
-                        },
-                    }),
-                });
 
-                console.log(`📡 Response status: ${response.status}`);
-
-                if (response.status === 429) {
-                    const retryAfter = response.headers.get('retry-after');
-                    const delay = retryAfter ? parseInt(retryAfter) * 1000 : Math.pow(2, attempt) * 5000;
-                    console.log(`⚠️  Rate limited. Retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})...`);
-                    if (attempt < maxRetries - 1) {
-                        await new Promise(resolve => setTimeout(resolve, delay));
-                        continue;
-                    } else {
-                        throw new Error('Gemini API rate limit exceeded');
-                    }
-                }
-
-                if (!response.ok) {
-                    const errorText = await response.text();
-                    console.error(`❌ API Error Response: ${errorText}`);
-                    throw new Error(`Gemini API error (${response.status}): ${errorText}`);
-                }
-
-                const jsonResponse = await response.json();
-                console.log(`✅ API call successful, response received`);
-                return jsonResponse;
-            } catch (error) {
-                console.error(`❌ Error in callGemini (attempt ${attempt + 1}):`, error.message);
-                if (attempt === maxRetries - 1 || error.message.includes('rate limit')) {
-                    throw error;
-                }
-                const delay = Math.pow(2, attempt) * 5000;
-                console.log(`⚠️  Gemini API error: ${error.message}. Retrying in ${delay}ms...`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-            }
-        }
-    }
 
     /**
      * Calculate correctness score based on test case results
@@ -125,7 +73,7 @@ class OAScoringService {
      */
     calculateEdgeCaseScore(testResults) {
         const edgeCases = testResults.filter(t => t.testType === 'edge');
-        
+
         if (edgeCases.length === 0) return 0;
 
         const edgePassed = edgeCases.filter(t => t.passed).length;
@@ -159,19 +107,15 @@ Respond ONLY in JSON format:
 }`;
 
         try {
-            const modelName = process.env.GEMINI_CODE_QUALITY_MODEL || 'gemini-2.0-flash';
-            const data = await this.callGemini(prompt, modelName, 0.7);
-            const aiResponse = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-            
-            // Extract JSON from response
-            const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-                const parsed = JSON.parse(jsonMatch[0]);
-                return {
-                    score: Math.round(parsed.score * 10) / 10,
-                    explanation: parsed.explanation,
-                };
-            }
+            const modelName = process.env.OPENAI_MODEL || 'gpt-4o';
+            // Force JSON mode for better reliability
+            const data = await callOpenAI(prompt, modelName, true);
+
+            // callOpenAI returns parsed object when jsonMode is true
+            return {
+                score: Math.round(Number(data.score) * 10) / 10,
+                explanation: data.explanation || 'Analyzed by AI',
+            };
         } catch (error) {
             console.error('Error evaluating code quality:', error);
         }
@@ -185,9 +129,9 @@ Respond ONLY in JSON format:
      */
     async analyzeApproach(question, candidateCode, language, failedTestCases = []) {
         const failedTestsInfo = failedTestCases.length > 0
-            ? `\n\nFailed Test Cases:\n${failedTestCases.map((tc, i) => 
+            ? `\n\nFailed Test Cases:\n${failedTestCases.map((tc, i) =>
                 `Test ${i + 1}:\nInput: ${tc.input}\nExpected: ${tc.expectedOutput}\nActual: ${tc.actualOutput}`
-              ).join('\n\n')}`
+            ).join('\n\n')}`
             : '';
 
         const prompt = `You are an expert programming interviewer analyzing a candidate's solution.
@@ -222,20 +166,16 @@ IMPORTANT: Respond in PLAIN TEXT JSON format. Do NOT use markdown code blocks, d
 }`;
 
         try {
-            const modelName = process.env.GEMINI_APPROACH_MODEL || 'gemini-2.0-flash';
-            const data = await this.callGemini(prompt, modelName, 0.7);
-            const aiResponse = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-            
-            const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-                const parsed = JSON.parse(jsonMatch[0]);
-                return {
-                    yourApproach: parsed.yourApproach,
-                    timeComplexity: parsed.timeComplexity,
-                    approachScore: Math.round(parsed.approachScore * 10) / 10,
-                    overallComments: parsed.overallComments,
-                };
-            }
+            const modelName = process.env.OPENAI_MODEL || 'gpt-4o';
+            // Force JSON mode
+            const parsed = await callOpenAI(prompt, modelName, true);
+
+            return {
+                yourApproach: parsed.yourApproach || 'Analyzed by AI',
+                timeComplexity: parsed.timeComplexity || 'N/A',
+                approachScore: Math.round(Number(parsed.approachScore) * 10) / 10,
+                overallComments: parsed.overallComments || '',
+            };
         } catch (error) {
             console.error('Error analyzing approach:', error);
         }
@@ -317,7 +257,7 @@ IMPORTANT: Respond in PLAIN TEXT JSON format. Do NOT use markdown code blocks, d
         }
 
         const overallScore = totalWeight > 0 ? totalWeightedScore / totalWeight : 0;
-        
+
         // Normalize to 10
         const normalizedScore = (overallScore / 10).toFixed(1);
 
@@ -332,11 +272,11 @@ IMPORTANT: Respond in PLAIN TEXT JSON format. Do NOT use markdown code blocks, d
      */
     sanitizeJSONString(jsonStr) {
         if (!jsonStr || typeof jsonStr !== 'string') return jsonStr;
-        
+
         // Remove control characters except for common escaped ones
         // ASCII control characters are 0x00-0x1F (0-31)
         let sanitized = jsonStr.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '');
-        
+
         return sanitized;
     }
 
@@ -345,11 +285,11 @@ IMPORTANT: Respond in PLAIN TEXT JSON format. Do NOT use markdown code blocks, d
      */
     aggressiveJSONClean(jsonStr) {
         if (!jsonStr || typeof jsonStr !== 'string') return jsonStr;
-        
+
         try {
             // Remove any trailing commas before closing braces/brackets
             let cleaned = jsonStr.replace(/,(\s*[}\]])/g, '$1');
-            
+
             return cleaned;
         } catch (e) {
             return jsonStr;
@@ -362,28 +302,28 @@ IMPORTANT: Respond in PLAIN TEXT JSON format. Do NOT use markdown code blocks, d
      */
     fixCodeFieldsBeforeParse(jsonStr) {
         if (!jsonStr || typeof jsonStr !== 'string') return jsonStr;
-        
+
         try {
             // Strategy: Find optimalSolution fields and properly escape their content
             // The LLM often includes unescaped quotes and newlines in Python code
-            
+
             let result = jsonStr;
             const fieldNames = ['optimalSolution', 'solution', 'code', 'implementation'];
-            
+
             for (const fieldName of fieldNames) {
                 // Find pattern: "fieldName": "...content..."
                 // We need to handle cases where content has unescaped quotes and newlines
-                
+
                 // Use a more sophisticated approach: find the field, then parse its value carefully
                 const fieldPattern = new RegExp(`"${fieldName}"\\s*:\\s*"`, 'g');
                 let match;
                 let lastIndex = 0;
                 let newResult = '';
-                
+
                 while ((match = fieldPattern.exec(result)) !== null) {
                     // Add everything before this match
                     newResult += result.substring(lastIndex, match.index + match[0].length);
-                    
+
                     // Now find the closing quote of this field's value
                     // We need to handle escaped quotes properly
                     let pos = match.index + match[0].length;
@@ -391,32 +331,32 @@ IMPORTANT: Respond in PLAIN TEXT JSON format. Do NOT use markdown code blocks, d
                     let depth = 0;
                     let inEscape = false;
                     let foundEnd = false;
-                    
+
                     while (pos < result.length) {
                         const char = result[pos];
-                        
+
                         if (inEscape) {
                             inEscape = false;
                             pos++;
                             continue;
                         }
-                        
+
                         if (char === '\\') {
                             inEscape = true;
                             pos++;
                             continue;
                         }
-                        
+
                         if (char === '"') {
                             // Found the end of the value
                             const rawValue = result.substring(valueStart, pos);
-                            
+
                             // Fix the value: escape quotes, newlines, tabs, backslashes
                             let fixedValue = rawValue;
-                            
+
                             // Only fix if it looks like it needs fixing (has actual newlines or unescaped quotes)
                             const needsFix = /[\n\t\r]/.test(rawValue) || (/"/.test(rawValue) && !/\\"/.test(rawValue));
-                            
+
                             if (needsFix) {
                                 fixedValue = rawValue
                                     .replace(/\\/g, '\\\\')  // Escape backslashes first
@@ -425,28 +365,28 @@ IMPORTANT: Respond in PLAIN TEXT JSON format. Do NOT use markdown code blocks, d
                                     .replace(/\r/g, '\\r')    // Escape carriage returns
                                     .replace(/\t/g, '\\t');   // Escape tabs
                             }
-                            
+
                             newResult += fixedValue + '"';
                             lastIndex = pos + 1;
                             foundEnd = true;
                             break;
                         }
-                        
+
                         pos++;
                     }
-                    
+
                     if (!foundEnd) {
                         // Couldn't find end, keep original
                         newResult = result;
                         break;
                     }
                 }
-                
+
                 // Add the rest of the string
                 newResult += result.substring(lastIndex);
                 result = newResult;
             }
-            
+
             return result;
         } catch (e) {
             console.error('Error in fixCodeFieldsBeforeParse:', e);
@@ -460,17 +400,17 @@ IMPORTANT: Respond in PLAIN TEXT JSON format. Do NOT use markdown code blocks, d
      */
     fixCodeFieldsInJSON(obj) {
         if (!obj || typeof obj !== 'object') return obj;
-        
+
         // Fields that typically contain code
         const codeFields = ['optimalSolution', 'solution', 'code', 'implementation'];
-        
+
         for (const field of codeFields) {
             if (obj[field] && typeof obj[field] === 'string') {
                 // Already properly escaped, don't double-escape
                 if (obj[field].includes('\\n') || obj[field].includes('\\"')) {
                     continue;
                 }
-                
+
                 // Escape backslashes first (must be first!)
                 let fixed = obj[field].replace(/\\/g, '\\\\');
                 // Escape quotes
@@ -479,11 +419,11 @@ IMPORTANT: Respond in PLAIN TEXT JSON format. Do NOT use markdown code blocks, d
                 fixed = fixed.replace(/\n/g, '\\n');
                 // Escape tabs
                 fixed = fixed.replace(/\t/g, '\\t');
-                
+
                 obj[field] = fixed;
             }
         }
-        
+
         // Recursively fix nested objects/arrays
         if (Array.isArray(obj)) {
             return obj.map(item => this.fixCodeFieldsInJSON(item));
@@ -494,7 +434,7 @@ IMPORTANT: Respond in PLAIN TEXT JSON format. Do NOT use markdown code blocks, d
             }
             return result;
         }
-        
+
         return obj;
     }
 
@@ -503,41 +443,41 @@ IMPORTANT: Respond in PLAIN TEXT JSON format. Do NOT use markdown code blocks, d
      */
     extractFirstBalancedJSON(text) {
         if (!text || typeof text !== 'string') return null;
-        
+
         // First sanitize the text
         text = this.sanitizeJSONString(text);
-        
+
         const start = text.indexOf('{');
         if (start === -1) return null;
         let depth = 0;
         let inString = false;
         let escaped = false;
-        
+
         for (let i = start; i < text.length; i++) {
             const ch = text[i];
-            
+
             // Handle escape sequences
             if (escaped) {
                 escaped = false;
                 continue;
             }
-            
+
             if (ch === '\\') {
                 escaped = true;
                 continue;
             }
-            
+
             // Handle string boundaries
             if (ch === '"') {
                 inString = !inString;
                 continue;
             }
-            
+
             // Only count braces outside of strings
             if (!inString) {
                 if (ch === '{') depth++;
                 else if (ch === '}') depth--;
-                
+
                 if (depth === 0) {
                     const candidate = text.slice(start, i + 1);
                     try {
@@ -652,74 +592,25 @@ Return this exact JSON structure:
 }`;
 
         try {
-            const modelName = process.env.GEMINI_QUESTION_GEN_MODEL || 'gemini-2.0-flash';
-            const data = await this.callGemini(prompt, modelName, 0.7);
-            const aiResponse = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-            
-            console.log('🤖 Raw AI Response (first 800 chars):', aiResponse.substring(0, 800));
-            
-            // Sanitize the response first
-            const sanitizedResponse = this.sanitizeJSONString(aiResponse);
-            
-            // Remove markdown code blocks if present
-            let cleanedResponse = sanitizedResponse.trim();
-            if (cleanedResponse.startsWith('```json')) {
-                cleanedResponse = cleanedResponse.replace(/^```json\s*/, '').replace(/```\s*$/, '');
-            } else if (cleanedResponse.startsWith('```')) {
-                cleanedResponse = cleanedResponse.replace(/^```\s*/, '').replace(/```\s*$/, '');
-            }
-            
-            // Pre-process to fix code fields BEFORE parsing
-            console.log('🔧 Pre-processing code fields...');
-            cleanedResponse = this.fixCodeFieldsBeforeParse(cleanedResponse);
-            
-            // Try robust extraction first
-            let result = this.extractFirstBalancedJSON(cleanedResponse);
-            
-            // Fallback to regex if balanced extraction fails
-            if (!result) {
-                const jsonMatch = cleanedResponse.match(/\{[\s\S]*\}/);
-                if (jsonMatch) {
-                    const sanitizedMatch = this.sanitizeJSONString(jsonMatch[0]);
-                    try {
-                        result = JSON.parse(sanitizedMatch);
-                    } catch (parseError) {
-                        console.error('❌ Initial JSON parse error:', parseError.message);
-                        
-                        // Try with aggressive cleaning
-                        try {
-                            const aggressiveCleaned = this.aggressiveJSONClean(sanitizedMatch);
-                            result = JSON.parse(aggressiveCleaned);
-                            console.log('✅ Aggressive cleaning succeeded!');
-                        } catch (finalError) {
-                            console.error('❌ Final JSON parse error:', finalError.message);
-                            console.error('Failed JSON string (first 500 chars):', sanitizedMatch.substring(0, 500));
-                            result = null;
-                        }
-                    }
-                }
-            }
-            
-            // Fix code fields if parsed successfully
-            if (result) {
-                console.log('🔧 Applying code field fixes...');
-                result = this.fixCodeFieldsInJSON(result);
-            }
-            
-            if (result) {
-                console.log('✅ Successfully parsed question:', result.questionId);
-                // Log test case counts
-                const visibleCount = result.visibleTestcases ? Object.keys(result.visibleTestcases).length : 0;
-                const hiddenCount = result.hiddenTestcases ? Object.keys(result.hiddenTestcases).length : 0;
-                const edgeCount = result.edgeTestcases ? Object.keys(result.edgeTestcases).length : 0;
-                console.log(`📊 Test cases generated: ${visibleCount} visible, ${hiddenCount} hidden, ${edgeCount} edge (Total: ${visibleCount + hiddenCount + edgeCount})`);
-                return result;
-            }
-            
-            console.error('❌ Failed to extract JSON from response');
-            console.error('Sanitized response (first 1000 chars):', cleanedResponse.substring(0, 1000));
-            throw new Error('Failed to parse question from LLM response');
-            
+            const modelName = process.env.OPENAI_QUESTION_GEN_MODEL || 'gpt-4o';
+
+            // Generate content using OpenAI with JSON mode enforce
+            // We can ask OpenAI for JSON response directly
+            const result = await callOpenAI(prompt, modelName, true);
+
+            console.log('✅ Successfully parsed question:', result.questionId);
+
+            // Fix code fields if needed (though OpenAI JSON mode is usually cleaner)
+            const cleanResult = this.fixCodeFieldsInJSON(result);
+
+            // Log test case counts
+            const visibleCount = cleanResult.visibleTestcases ? Object.keys(cleanResult.visibleTestcases).length : 0;
+            const hiddenCount = cleanResult.hiddenTestcases ? Object.keys(cleanResult.hiddenTestcases).length : 0;
+            const edgeCount = cleanResult.edgeTestcases ? Object.keys(cleanResult.edgeTestcases).length : 0;
+            console.log(`📊 Test cases generated: ${visibleCount} visible, ${hiddenCount} hidden, ${edgeCount} edge (Total: ${visibleCount + hiddenCount + edgeCount})`);
+
+            return cleanResult;
+
         } catch (error) {
             console.error('Error generating question:', error);
             throw error;
@@ -841,43 +732,22 @@ Return this exact JSON structure (an array of ${questionCount} questions):
 
         try {
             console.log(`🚀 Generating ${questionCount} questions in batch mode...`);
-            const modelName = process.env.GEMINI_QUESTION_GEN_MODEL || 'gemini-2.0-flash';
+            const modelName = process.env.OPENAI_QUESTION_GEN_MODEL || 'gpt-4o';
             console.log(`📡 Using model: ${modelName}`);
-            
-            let data;
+
+            let aiResponse;
             try {
-                data = await this.callGemini(prompt, modelName, 0.7, 2);
+                aiResponse = await callOpenAI(prompt, modelName, false);
             } catch (apiError) {
-                console.error('❌ callGemini threw an error:', apiError);
+                console.error('❌ callOpenAI threw an error:', apiError);
                 throw apiError;
             }
-            
-            if (!data) {
-                console.error('❌ callGemini returned null/undefined');
-                throw new Error('No data returned from Gemini API');
+
+            if (!aiResponse) {
+                throw new Error('No data returned from OpenAI API');
             }
-            
-            console.log('📦 API response received, checking structure...');
-            console.log('📦 data type:', typeof data);
-            console.log('📦 data keys:', Object.keys(data || {}));
-            console.log('📦 candidates exists:', !!data?.candidates);
-            console.log('📦 candidates is array:', Array.isArray(data?.candidates));
-            console.log('📦 candidates length:', data?.candidates?.length);
-            
-            if (!data?.candidates || !Array.isArray(data.candidates) || data.candidates.length === 0) {
-                console.error('❌ No candidates in response!');
-                console.error('❌ Full response:', JSON.stringify(data, null, 2));
-                throw new Error('Invalid response structure: no candidates array');
-            }
-            
-            const firstCandidate = data.candidates[0];
-            console.log('📦 First candidate keys:', Object.keys(firstCandidate || {}));
-            console.log('📦 content exists:', !!firstCandidate?.content);
-            console.log('📦 parts exists:', !!firstCandidate?.content?.parts);
-            console.log('📦 parts is array:', Array.isArray(firstCandidate?.content?.parts));
-            
-            const aiResponse = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-            
+
+
             console.log(`🤖 Extracted text length: ${aiResponse.length} characters`);
             if (aiResponse.length === 0) {
                 console.error('❌ Empty text in response!');
@@ -886,11 +756,11 @@ Return this exact JSON structure (an array of ${questionCount} questions):
             }
             console.log('🤖 First 500 chars:', aiResponse.substring(0, 500));
             console.log('🤖 Last 500 chars:', aiResponse.substring(Math.max(0, aiResponse.length - 500)));
-            
+
             // Sanitize the response first
             const sanitizedResponse = this.sanitizeJSONString(aiResponse);
             console.log(`🧹 Sanitized response length: ${sanitizedResponse.length} characters`);
-            
+
             // Remove markdown code blocks if present
             let cleanedResponse = sanitizedResponse.trim();
             if (cleanedResponse.startsWith('```json')) {
@@ -898,14 +768,14 @@ Return this exact JSON structure (an array of ${questionCount} questions):
             } else if (cleanedResponse.startsWith('```')) {
                 cleanedResponse = cleanedResponse.replace(/^```\s*/, '').replace(/```\s*$/, '');
             }
-            
+
             // Pre-process to fix code fields BEFORE parsing
             console.log('🔧 Pre-processing code fields...');
             cleanedResponse = this.fixCodeFieldsBeforeParse(cleanedResponse);
-            
+
             // Try robust extraction
             let result = this.extractFirstBalancedJSON(cleanedResponse);
-            
+
             // Fallback to regex
             if (!result) {
                 const jsonMatch = cleanedResponse.match(/\{[\s\S]*\}/);
@@ -916,7 +786,7 @@ Return this exact JSON structure (an array of ${questionCount} questions):
                     } catch (parseError) {
                         console.error('❌ Initial JSON parse error:', parseError.message);
                         console.error('❌ Error at position:', parseError.message.match(/position (\d+)/)?.[1]);
-                        
+
                         // Try one more time with aggressive cleaning
                         try {
                             const aggressiveCleaned = this.aggressiveJSONClean(sanitizedMatch);
@@ -931,16 +801,16 @@ Return this exact JSON structure (an array of ${questionCount} questions):
                     }
                 }
             }
-            
+
             // If we successfully parsed, fix any code fields that might have issues
             if (result && result.questions && Array.isArray(result.questions)) {
                 console.log('🔧 Applying code field fixes...');
                 result.questions = result.questions.map(q => this.fixCodeFieldsInJSON(q));
             }
-            
+
             if (result && result.questions && Array.isArray(result.questions)) {
                 console.log(`✅ Successfully parsed ${result.questions.length} questions in batch`);
-                
+
                 // Log test case counts for each question
                 result.questions.forEach((q, idx) => {
                     const visibleCount = q.visibleTestcases ? Object.keys(q.visibleTestcases).length : 0;
@@ -948,10 +818,10 @@ Return this exact JSON structure (an array of ${questionCount} questions):
                     const edgeCount = q.edgeTestcases ? Object.keys(q.edgeTestcases).length : 0;
                     console.log(`📊 Question ${idx + 1} (${q.questionId}): ${visibleCount} visible, ${hiddenCount} hidden, ${edgeCount} edge (Total: ${visibleCount + hiddenCount + edgeCount})`);
                 });
-                
+
                 return result.questions;
             }
-            
+
             console.error('❌ Failed to extract questions array from batch response');
             console.error('❌ Response structure check:');
             console.error('   - result exists:', !!result);
@@ -961,11 +831,11 @@ Return this exact JSON structure (an array of ${questionCount} questions):
                 console.error('   - result keys:', Object.keys(result));
             }
             throw new Error('Failed to parse batch questions from LLM response');
-            
+
         } catch (error) {
             console.error('❌ Error generating questions in batch:', error.message);
             console.log('⚠️  Falling back to sequential generation...');
-            
+
             // Fallback: generate questions one by one
             const questions = [];
             for (let i = 0; i < questionCount; i++) {

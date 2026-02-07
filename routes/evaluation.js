@@ -1,6 +1,6 @@
 import express from 'express';
 import { body, validationResult } from 'express-validator';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { callOpenAI } from '../lib/openai.js';
 import CandidateAssessment from '../models/CandidateAssessment.js';
 import AssessmentAnswer from '../models/AssessmentAnswer.js';
 import Evaluation from '../models/Evaluation.js';
@@ -9,9 +9,8 @@ import { authenticateToken, requireRecruiter } from '../middleware/auth.js';
 
 const router = express.Router();
 
-// Initialize Gemini AI
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-2.0-flash' });
+// OpenAI initialized in lib/openai.js
+
 
 // ============================================================================
 // EVALUATION ROUTES
@@ -146,7 +145,7 @@ router.get('/result/:candidateAssessmentId', authenticateToken, requireRecruiter
  * Set admin decision (PASS/FAIL/HOLD)
  */
 router.post('/admin-decision/:candidateAssessmentId', authenticateToken, requireRecruiter, [
-    body('decision').isIn(['PASS', 'FAIL', 'HOLD']).withMessage('Invalid decision'),
+    body('decision').isIn(['PASS', 'FAIL', 'HOLD', 'CHEATING']).withMessage('Invalid decision'),
     body('notes').optional().isString(),
 ], async (req, res) => {
     try {
@@ -217,16 +216,22 @@ router.post('/admin-decision/:candidateAssessmentId', authenticateToken, require
 // HELPER: Run Full Evaluation
 // ============================================================================
 
-async function runEvaluation(candidateAssessmentId) {
+// Export for use in other routes (e.g., triggering after submission)
+export async function runEvaluation(candidateAssessmentId) {
+    console.log(`🚀 Starting evaluation for: ${candidateAssessmentId}`);
     try {
         const candidateAssessment = await CandidateAssessment.findById(candidateAssessmentId)
             .populate('jd')
             .populate('assignedSet');
 
-        if (!candidateAssessment) return;
+        if (!candidateAssessment) {
+            console.error(`❌ Evaluation aborted: Assessment ${candidateAssessmentId} not found`);
+            return;
+        }
 
         // Get all answers
         const answers = await AssessmentAnswer.find({ candidateAssessment: candidateAssessmentId });
+        console.log(`📝 Found ${answers.length} answer sections for ${candidateAssessmentId}`);
 
         // Create or get evaluation
         let evaluation = await Evaluation.findOne({ candidateAssessment: candidateAssessmentId });
@@ -239,6 +244,11 @@ async function runEvaluation(candidateAssessmentId) {
 
         const set = candidateAssessment.assignedSet;
         const jd = candidateAssessment.jd;
+
+        if (!jd || !jd.assessmentConfig) {
+            console.error(`❌ Evaluation aborted: JD or config missing for ${candidateAssessmentId}`);
+            return;
+        }
 
         // ==================== OBJECTIVE SECTION ====================
         const objectiveAnswers = answers.find(a => a.section === 'objective');
@@ -445,7 +455,7 @@ async function runEvaluation(candidateAssessmentId) {
         console.log(`✅ Evaluation complete for ${candidateAssessmentId}: ${evaluation.percentage.toFixed(1)}%`);
 
     } catch (error) {
-        console.error('❌ Evaluation error:', error);
+        console.error(`❌ Evaluation error for ${candidateAssessmentId}:`, error);
     }
 }
 
@@ -476,10 +486,7 @@ Analyze the answer and return JSON:
 Be fair but strict. Return ONLY valid JSON.`;
 
     try {
-        const result = await model.generateContent(prompt);
-        let response = result.response.text();
-        response = response.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-        return JSON.parse(response);
+        return await callOpenAI(prompt, process.env.OPENAI_MODEL || 'gpt-4o', true);
     } catch (error) {
         console.error('❌ AI grading error:', error);
         return {

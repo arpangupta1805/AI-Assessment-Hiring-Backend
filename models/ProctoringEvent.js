@@ -32,6 +32,13 @@ const ProctoringEventSchema = new mongoose.Schema(
                 'browser_resize',      // Browser window resized
                 'fullscreen_exit',     // Exited fullscreen mode
                 'dev_tools',           // Developer tools opened
+                'camera_denied',       // Camera access denied
+                'fullscreen_failed',   // Failed to enter fullscreen
+                'copy_attempt',        // Copy attempt
+                'paste_attempt',       // Paste attempt
+                'cut_attempt',         // Cut attempt
+                'assessment_completed', // Assessment completed
+                'periodic_check',      // Periodic status/photo check
             ],
             required: true,
         },
@@ -125,6 +132,13 @@ ProctoringEventSchema.statics.getSeverityForEvent = function (eventType) {
         'browser_resize': 'low',
         'fullscreen_exit': 'medium',
         'dev_tools': 'high',
+        'camera_denied': 'high',
+        'fullscreen_failed': 'medium',
+        'copy_attempt': 'medium',
+        'paste_attempt': 'medium',
+        'cut_attempt': 'medium',
+        'assessment_completed': 'low',
+        'periodic_check': 'low',
     };
     return severityMap[eventType] || 'medium';
 };
