@@ -251,23 +251,37 @@ export async function runEvaluation(candidateAssessmentId) {
         }
 
         // ==================== OBJECTIVE SECTION ====================
-        const objectiveAnswers = answers.find(a => a.section === 'objective');
-        if (objectiveAnswers) {
+        const objectiveAnswersDoc = answers.find(a => a.section === 'objective');
+        const objectiveAnswers = objectiveAnswersDoc ? objectiveAnswersDoc.objectiveAnswers : [];
+
+        {
             let score = 0, maxScore = 0, correct = 0;
             const details = [];
 
-            objectiveAnswers.objectiveAnswers.forEach(ans => {
+            // Calculate Max Score based on ALL questions in the Set
+            set.objectiveQuestions.forEach(q => {
+                maxScore += q.points || 1;
+            });
+
+            // Calculate Score based on answers
+            objectiveAnswers.forEach(ans => {
                 const question = set.objectiveQuestions.find(q => q.questionId === ans.questionId);
                 if (question) {
-                    maxScore += question.points || 1;
-                    if (ans.isCorrect) {
+                    // Always verify correctness against the source of truth (Set)
+                    let isAnsCorrect = false;
+                    if (ans.selectedOptionIndex !== undefined && ans.selectedOptionIndex !== null) {
+                        const selectedOpt = question.options[ans.selectedOptionIndex];
+                        isAnsCorrect = selectedOpt && selectedOpt.isCorrect;
+                    }
+
+                    if (isAnsCorrect) {
                         score += question.points || 1;
                         correct++;
                     }
                     details.push({
                         questionId: ans.questionId,
-                        isCorrect: ans.isCorrect,
-                        points: ans.isCorrect ? question.points || 1 : 0,
+                        isCorrect: !!isAnsCorrect,
+                        points: isAnsCorrect ? question.points || 1 : 0,
                     });
                 }
             });
@@ -276,7 +290,7 @@ export async function runEvaluation(candidateAssessmentId) {
                 score,
                 maxScore,
                 percentage: maxScore > 0 ? (score / maxScore) * 100 : 0,
-                questionsAttempted: objectiveAnswers.objectiveAnswers.length,
+                questionsAttempted: objectiveAnswers.length,
                 questionsCorrect: correct,
                 totalQuestions: set.objectiveQuestions.length,
                 details,
@@ -284,12 +298,17 @@ export async function runEvaluation(candidateAssessmentId) {
         }
 
         // ==================== SUBJECTIVE SECTION ====================
-        const subjectiveAnswers = answers.find(a => a.section === 'subjective');
-        if (subjectiveAnswers && subjectiveAnswers.subjectiveAnswers.length > 0) {
+        const subjectiveAnswersDoc = answers.find(a => a.section === 'subjective');
+        if (subjectiveAnswersDoc && subjectiveAnswersDoc.subjectiveAnswers.length > 0) {
             const details = [];
             let totalScore = 0, totalMaxScore = 0;
 
-            for (const ans of subjectiveAnswers.subjectiveAnswers) {
+            // Calculate Max Score based on ALL questions
+            set.subjectiveQuestions.forEach(q => {
+                totalMaxScore += q.points || 10;
+            });
+
+            for (const ans of subjectiveAnswersDoc.subjectiveAnswers) {
                 const question = set.subjectiveQuestions.find(q => q.questionId === ans.questionId);
                 if (question && ans.answer) {
                     // AI grading
@@ -313,7 +332,6 @@ export async function runEvaluation(candidateAssessmentId) {
                     });
 
                     totalScore += aiScore;
-                    totalMaxScore += maxPoints;
 
                     // Update answer document with AI scores
                     ans.aiScore = aiScore;
@@ -323,25 +341,44 @@ export async function runEvaluation(candidateAssessmentId) {
                 }
             }
 
-            await subjectiveAnswers.save();
+            await subjectiveAnswersDoc.save();
 
             evaluation.sections.subjective = {
                 score: totalScore,
                 maxScore: totalMaxScore,
                 percentage: totalMaxScore > 0 ? (totalScore / totalMaxScore) * 100 : 0,
-                questionsAttempted: subjectiveAnswers.subjectiveAnswers.filter(a => a.answer).length,
+                questionsAttempted: subjectiveAnswersDoc.subjectiveAnswers.filter(a => a.answer).length,
                 totalQuestions: set.subjectiveQuestions.length,
                 details,
+            };
+        } else {
+            // Handle case where no subjective answers exist but questions exist
+            let totalMaxScore = 0;
+            set.subjectiveQuestions.forEach(q => {
+                totalMaxScore += q.points || 10;
+            });
+            evaluation.sections.subjective = {
+                score: 0,
+                maxScore: totalMaxScore,
+                percentage: 0,
+                questionsAttempted: 0,
+                totalQuestions: set.subjectiveQuestions.length,
+                details: [],
             };
         }
 
         // ==================== PROGRAMMING SECTION ====================
-        const programmingAnswers = answers.find(a => a.section === 'programming');
-        if (programmingAnswers && programmingAnswers.programmingAnswers.length > 0) {
+        const programmingAnswersDoc = answers.find(a => a.section === 'programming');
+        if (programmingAnswersDoc && programmingAnswersDoc.programmingAnswers.length > 0) {
             const details = [];
             let totalScore = 0, totalMaxScore = 0;
 
-            for (const ans of programmingAnswers.programmingAnswers) {
+            // Calculate Max Score based on ALL questions
+            set.programmingQuestions.forEach(q => {
+                totalMaxScore += q.points || 20;
+            });
+
+            for (const ans of programmingAnswersDoc.programmingAnswers) {
                 const question = set.programmingQuestions.find(q => q.questionId === ans.questionId);
                 if (question) {
                     const maxPoints = question.points || 20;
@@ -362,7 +399,6 @@ export async function runEvaluation(candidateAssessmentId) {
                     });
 
                     totalScore += testScore;
-                    totalMaxScore += maxPoints;
                 }
             }
 
@@ -370,9 +406,23 @@ export async function runEvaluation(candidateAssessmentId) {
                 score: totalScore,
                 maxScore: totalMaxScore,
                 percentage: totalMaxScore > 0 ? (totalScore / totalMaxScore) * 100 : 0,
-                questionsAttempted: programmingAnswers.programmingAnswers.filter(a => a.code).length,
+                questionsAttempted: programmingAnswersDoc.programmingAnswers.filter(a => a.code).length,
                 totalQuestions: set.programmingQuestions.length,
                 details,
+            };
+        } else {
+            // Handle case where no programming answers exist but questions exist
+            let totalMaxScore = 0;
+            set.programmingQuestions.forEach(q => {
+                totalMaxScore += q.points || 20;
+            });
+            evaluation.sections.programming = {
+                score: 0,
+                maxScore: totalMaxScore,
+                percentage: 0,
+                questionsAttempted: 0,
+                totalQuestions: set.programmingQuestions.length,
+                details: [],
             };
         }
 

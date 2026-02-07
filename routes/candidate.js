@@ -296,8 +296,8 @@ router.post('/capture-photo/:candidateAssessmentId', [
         // Save base64 image to file
         let photoUrl = photoData;
         if (photoData.startsWith('data:image/')) {
-            // It's base64, save to file
-            photoUrl = await saveBase64Image(photoData, `candidate_${candidateAssessmentId}`);
+            // It's base64, save directly to DB as requested by user
+            photoUrl = photoData;
         }
 
         // Save photo URL
@@ -696,7 +696,7 @@ ${resumeText.substring(0, 4000)}
   "matchScore": number (0-100),
   "scoreJustification": "DETAILED breakdown: [Skills: X/40, Projects: X/40, Fit: X/20]. Explain why points were given/withheld.",
   "skillMatches": [
-    {"skill": "string", "matched": boolean, "confidence": 0-100, "evidenceFoundInProjects": boolean}
+    {"skill": "string", "matched": boolean, "confidence": number (0-100), "evidenceFoundInProjects": boolean}
   ],
   "experienceMatch": boolean,
   "qualificationMatch": boolean,

@@ -3,6 +3,7 @@ import JobDescription from '../models/JobDescription.js';
 import CandidateAssessment from '../models/CandidateAssessment.js';
 import Evaluation from '../models/Evaluation.js';
 import ProctoringEvent from '../models/ProctoringEvent.js';
+import AssessmentSet from '../models/AssessmentSet.js';
 import AssessmentAnswer from '../models/AssessmentAnswer.js';
 import { authenticateToken, requireRecruiter } from '../middleware/auth.js';
 
@@ -204,12 +205,90 @@ router.get('/candidate/:candidateAssessmentId', authenticateToken, requireRecrui
             },
         ]);
 
+        // Get assigned set
+        const assessmentSet = await AssessmentSet.findById(candidateAssessment.assignedSet);
+
+        // Construct full report (Questions + Answers + Scores)
+        const report = {
+            objective: [],
+            subjective: [],
+            programming: [],
+        };
+
+        if (assessmentSet) {
+            // Helper to get answers for a section
+            const getSectionAnswers = (section) => {
+                const doc = answers.find(a => a.section === section);
+                return doc ? (doc[`${section}Answers`] || []) : [];
+            };
+
+            const objectiveAnswers = getSectionAnswers('objective');
+            const subjectiveAnswers = getSectionAnswers('subjective');
+            const programmingAnswers = getSectionAnswers('programming');
+
+            // Objective Report
+            report.objective = assessmentSet.objectiveQuestions.map(q => {
+                const ans = objectiveAnswers.find(a => a.questionId === q.questionId);
+                return {
+                    questionId: q.questionId,
+                    questionText: q.questionText,
+                    options: q.options,
+                    correctOptionIndex: q.options.findIndex(o => o.isCorrect),
+                    selectedOptionIndex: ans?.selectedOptionIndex,
+                    isCorrect: ans ? (
+                        ans.selectedOptionIndex !== undefined &&
+                        ans.selectedOptionIndex !== null &&
+                        q.options[ans.selectedOptionIndex]?.isCorrect
+                    ) : false,
+                    score: ans ? (
+                        ans.selectedOptionIndex !== undefined &&
+                            ans.selectedOptionIndex !== null &&
+                            q.options[ans.selectedOptionIndex]?.isCorrect ? q.points : 0
+                    ) : 0,
+                    maxScore: q.points || 1,
+                };
+            });
+
+            // Subjective Report
+            report.subjective = assessmentSet.subjectiveQuestions.map(q => {
+                const ans = subjectiveAnswers.find(a => a.questionId === q.questionId);
+                const evalDetails = evaluation?.details?.subjective?.find(e => e.questionId === q.questionId);
+                return {
+                    questionId: q.questionId,
+                    questionText: q.questionText,
+                    expectedAnswer: q.expectedAnswer,
+                    candidateAnswer: ans?.answer || 'Not answered',
+                    aiFeedback: evalDetails?.feedback || 'No feedback',
+                    score: evalDetails?.score || 0,
+                    maxScore: q.points || 10,
+                };
+            });
+
+            // Programming Report
+            report.programming = assessmentSet.programmingQuestions.map(q => {
+                const ans = programmingAnswers.find(a => a.questionId === q.questionId);
+                const evalDetails = evaluation?.details?.programming?.find(e => e.questionId === q.questionId);
+                return {
+                    questionId: q.questionId,
+                    title: q.title,
+                    questionText: q.questionText,
+                    code: ans?.code || '// No code submitted',
+                    language: ans?.language || 'text',
+                    testCasesPassed: evalDetails?.testCasesPassed || 0,
+                    totalTestCases: evalDetails?.totalTestCases || 0,
+                    score: evalDetails?.score || 0,
+                    maxScore: q.points || 20,
+                };
+            });
+        }
+
         res.json({
             success: true,
             data: {
                 candidateAssessment,
                 evaluation,
                 answers,
+                report, // Added report
                 proctoringStats,
             },
         });
@@ -218,6 +297,65 @@ router.get('/candidate/:candidateAssessmentId', authenticateToken, requireRecrui
         res.status(500).json({
             success: false,
             error: 'Failed to fetch candidate details',
+        });
+    }
+});
+
+/**
+ * POST /api/admin/candidate/:candidateAssessmentId/email-report
+ * Send assessment report to candidate via email
+ */
+router.post('/candidate/:candidateAssessmentId/email-report', authenticateToken, requireRecruiter, async (req, res) => {
+    try {
+        const { candidateAssessmentId } = req.params;
+
+        const candidateAssessment = await CandidateAssessment.findById(candidateAssessmentId)
+            .populate('candidate', 'name email')
+            .populate('jd', 'company parsedContent.roleTitle');
+
+        if (!candidateAssessment) {
+            return res.status(404).json({ success: false, error: 'Candidate not found' });
+        }
+
+        // Verify ownership
+        if (candidateAssessment.jd.company.toString() !== req.user.company.toString()) {
+            return res.status(403).json({ success: false, error: 'Access denied' });
+        }
+
+        const evaluation = await Evaluation.findOne({ candidateAssessment: candidateAssessmentId });
+
+        if (!evaluation) {
+            return res.status(400).json({ success: false, error: 'Evaluation not generated yet' });
+        }
+
+        // Prepare data for email
+        const emailData = {
+            candidateName: candidateAssessment.candidate.name,
+            roleTitle: candidateAssessment.jd.parsedContent?.roleTitle || 'Role',
+            companyName: 'TechCorp', // You might want to fetch actual company name if stored in User model
+            totalScore: Math.round(evaluation.percentage || 0),
+            resumeScore: Math.round(candidateAssessment.resume?.matchScore || 0),
+            status: candidateAssessment.status,
+            sections: {
+                objective: Math.round(evaluation.sections?.objective?.percentage || 0),
+                subjective: Math.round(evaluation.sections?.subjective?.percentage || 0),
+                programming: Math.round(evaluation.sections?.programming?.percentage || 0),
+            }
+        };
+
+        // Send email
+        await import('../services/emailService.js').then(m => m.default.sendAssessmentReport(candidateAssessment.candidate.email, emailData));
+
+        res.json({
+            success: true,
+            message: 'Report sent successfully',
+        });
+
+    } catch (error) {
+        console.error('❌ Send report error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to send report email',
         });
     }
 });
@@ -430,8 +568,79 @@ router.get('/analytics/:jdId', authenticateToken, requireRecruiter, async (req, 
 // ============================================================================
 
 /**
+ * GET /api/admin/export/:jdId/csv
+ * Export candidates data as CSV with specific fields
+ */
+router.get('/export/:jdId/csv', authenticateToken, requireRecruiter, async (req, res) => {
+    try {
+        const { jdId } = req.params;
+
+        // Verify JD ownership
+        const jd = await JobDescription.findOne({
+            _id: jdId,
+            company: req.user.company,
+        });
+
+        if (!jd) {
+            return res.status(404).json({
+                success: false,
+                error: 'JD not found',
+            });
+        }
+
+        const candidates = await CandidateAssessment.find({ jd: jdId })
+            .populate('candidate', 'name email')
+            .lean();
+
+        const evaluations = await Evaluation.find({
+            candidateAssessment: { $in: candidates.map(c => c._id) },
+        }).lean();
+
+        const evaluationMap = {};
+        evaluations.forEach(e => {
+            evaluationMap[e.candidateAssessment.toString()] = e;
+        });
+
+        // Map to requested fields: Name, Email, Status, Resume Match Score, Score, Submitted
+        const exportData = candidates.map(c => {
+            const eval_ = evaluationMap[c._id.toString()];
+            return {
+                Name: c.candidate?.name || 'Unknown',
+                Email: c.candidate?.email || 'Unknown',
+                Status: c.status,
+                'Resume Match Score': c.resume?.matchScore || 0,
+                Score: eval_?.percentage ? `${eval_?.percentage.toFixed(1)}%` : '0%',
+                Submitted: c.submittedAt ? new Date(c.submittedAt).toLocaleDateString() : 'No',
+            };
+        });
+
+        // Generate CSV
+        if (exportData.length === 0) {
+            return res.status(400).json({ success: false, error: 'No data to export' });
+        }
+
+        const headers = Object.keys(exportData[0]).join(',');
+        const rows = exportData.map(row =>
+            Object.values(row).map(v => `"${v}"`).join(',')
+        ).join('\n');
+        const csv = headers + '\n' + rows;
+
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename="candidates-${jdId}.csv"`);
+        return res.send(csv);
+
+    } catch (error) {
+        console.error('❌ Export CSV error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to export CSV',
+        });
+    }
+});
+
+/**
  * GET /api/admin/export/:jdId
- * Export candidates data as CSV
+ * Export candidates data as JSON (Legacy/General)
  */
 router.get('/export/:jdId', authenticateToken, requireRecruiter, async (req, res) => {
     try {
