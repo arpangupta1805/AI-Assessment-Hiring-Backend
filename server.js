@@ -32,7 +32,7 @@ const app = express();
 // Middleware - Allow multiple origins
 const allowedOrigins = process.env.FRONTEND_URL
   ? process.env.FRONTEND_URL.split(',').map(url => url.trim())
-  : ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:3000'];
+  : ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:3000', 'https://ai-hiring-assessment-frontend.vercel.app'];
 
 console.log('🔧 Allowed CORS origins:', allowedOrigins);
 
