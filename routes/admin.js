@@ -592,6 +592,8 @@ router.get('/export/:jdId/csv', authenticateToken, requireRecruiter, async (req,
             .populate('candidate', 'name email')
             .lean();
 
+        console.log(`📊 Export CSV: Found ${candidates.length} candidates for JD ${jdId}`);
+
         const evaluations = await Evaluation.find({
             candidateAssessment: { $in: candidates.map(c => c._id) },
         }).lean();
@@ -615,15 +617,16 @@ router.get('/export/:jdId/csv', authenticateToken, requireRecruiter, async (req,
         });
 
         // Generate CSV
-        if (exportData.length === 0) {
-            return res.status(400).json({ success: false, error: 'No data to export' });
-        }
+        const headers = ['Name', 'Email', 'Status', 'Resume Match Score', 'Score', 'Submitted'];
 
-        const headers = Object.keys(exportData[0]).join(',');
-        const rows = exportData.map(row =>
-            Object.values(row).map(v => `"${v}"`).join(',')
-        ).join('\n');
-        const csv = headers + '\n' + rows;
+        let csv = headers.join(',') + '\n';
+
+        if (exportData.length > 0) {
+            const rows = exportData.map(row =>
+                Object.values(row).map(v => `"${v}"`).join(',')
+            ).join('\n');
+            csv += rows;
+        }
 
         res.setHeader('Content-Type', 'text/csv');
         res.setHeader('Content-Disposition', `attachment; filename="candidates-${jdId}.csv"`);

@@ -18,6 +18,7 @@ import emailRouter from './routes/email.js';
 
 // Services
 import emailService from './services/emailService.js';
+import EmailTemplate from './models/EmailTemplate.js';
 
 // ES Module path helpers
 const __filename = fileURLToPath(import.meta.url);
@@ -56,7 +57,12 @@ app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Connect to MongoDB
-connectDB();
+connectDB().then(() => {
+  // Seed email templates
+  EmailTemplate.seedDefaults()
+    .then(() => console.log('📧 Email templates seeded'))
+    .catch(err => console.error('❌ Failed to seed email templates:', err));
+});
 
 // Initialize services
 emailService.init();

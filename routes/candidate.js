@@ -660,6 +660,11 @@ async function matchResumeWithJD(candidateAssessmentId) {
 
         const prompt = `You are an expert technical recruiter specializing in identifying high-potential talent. Your task is to perform an in-depth scoring of the following Resume against the Job Description (JD).
 
+### CRITICAL VALIDATION STEP:
+First, review the content below. Is this document a professional resume/CV? 
+- If the content is a research paper, article, blog post, code snippet, or random text: **RETURN "isResume": false and "matchScore": 0 immediately.**
+- Only proceed with scoring if it is a valid resume/CV.
+
 ### SCORING RUBRIC (Total 100 points)
 1. **Applied Technical Skills (40 points)**: 
    - **Crucial**: Do NOT solely rely on the "Skills" header. Analyze the projects and work experience to find evidence of skill application.
@@ -693,8 +698,9 @@ ${resumeText.substring(0, 4000)}
 
 ### OUTPUT FORMAT (JSON ONLY)
 {
+  "isResume": boolean,
   "matchScore": number (0-100),
-  "scoreJustification": "DETAILED breakdown: [Skills: X/40, Projects: X/40, Fit: X/20]. Explain why points were given/withheld.",
+  "scoreJustification": "DETAILED breakdown: [Skills: X/40, Projects: X/40, Fit: X/20]. Explain why points were given/withheld. If not a resume, state 'Invalid document type'.",
   "skillMatches": [
     {"skill": "string", "matched": boolean, "confidence": number (0-100), "evidenceFoundInProjects": boolean}
   ],
@@ -714,26 +720,41 @@ Return ONLY valid JSON.`;
             const threshold = jd.assessmentConfig?.resumeMatchThreshold || 70;
 
             // Update candidate assessment
-            candidateAssessment.resume.matchScore = analysis.matchScore || 0;
-            candidateAssessment.resume.matchDetails = {
-                skillMatches: analysis.skillMatches || [],
-                experienceMatch: analysis.experienceMatch || false,
-                qualificationMatch: analysis.qualificationMatch || false,
-                overallAnalysis: analysis.overallAnalysis || '',
-            };
-            candidateAssessment.resume.isFake = analysis.isFake || false;
-            candidateAssessment.resume.fakeReasons = analysis.fakeReasons || [];
-            candidateAssessment.resume.passedThreshold = analysis.matchScore >= threshold && !analysis.isFake;
-            candidateAssessment.resume.analyzedAt = new Date();
+            const isResume = analysis.isResume !== false; // Default to true if missing for backward compatibility, but prompt asks for it
 
-            if (candidateAssessment.resume.passedThreshold) {
-                candidateAssessment.status = 'ready';
-            } else {
+            if (!isResume) {
+                candidateAssessment.resume.matchScore = 0;
+                candidateAssessment.resume.matchDetails = {
+                    skillMatches: [],
+                    experienceMatch: false,
+                    qualificationMatch: false,
+                    overallAnalysis: 'Document identification failed. The uploaded file does not appear to be a valid resume/CV.',
+                };
+                candidateAssessment.resume.passedThreshold = false;
                 candidateAssessment.status = 'resume_rejected';
+            } else {
+                candidateAssessment.resume.matchScore = analysis.matchScore || 0;
+                candidateAssessment.resume.matchDetails = {
+                    skillMatches: analysis.skillMatches || [],
+                    experienceMatch: analysis.experienceMatch || false,
+                    qualificationMatch: analysis.qualificationMatch || false,
+                    overallAnalysis: analysis.overallAnalysis || '',
+                };
+                candidateAssessment.resume.passedThreshold = candidateAssessment.resume.matchScore >= threshold && !analysis.isFake;
+
+                if (candidateAssessment.resume.passedThreshold) {
+                    candidateAssessment.status = 'ready';
+                } else {
+                    candidateAssessment.status = 'resume_rejected';
+                }
             }
 
+            candidateAssessment.resume.isFake = analysis.isFake || false;
+            candidateAssessment.resume.fakeReasons = analysis.fakeReasons || [];
+            candidateAssessment.resume.analyzedAt = new Date();
+
             await candidateAssessment.save();
-            console.log(`✅ Resume matched for ${candidateAssessmentId}: score = ${analysis.matchScore}, passed = ${candidateAssessment.resume.passedThreshold} `);
+            console.log(`✅ Resume matched for ${candidateAssessmentId}: isResume=${isResume}, score=${candidateAssessment.resume.matchScore}, passed=${candidateAssessment.resume.passedThreshold}`);
             return candidateAssessment;
 
         } catch (parseError) {
