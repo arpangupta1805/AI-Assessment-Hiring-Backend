@@ -12,7 +12,7 @@ import feedbackinterview from '../models/feedbackofinterview.js';
 import FollowUpQuestion from '../models/FollowUpQuestion.js';
 import InterviewMetadata from '../models/InterviewMetadata.js';
 import { detectFollowUpNeed, generateFollowUpQuestion, checkFollowUpHeuristics, extractFirstBalancedJSON } from '../services/followUpService.js';
-import { callOpenAI } from '../lib/openai.js';
+import { callGemini } from '../lib/gemini.js';
 
 const router = express.Router();
 
@@ -418,8 +418,8 @@ Format the response as a JSON array with exactly ${questionCount} objects, each 
 Return ONLY the JSON array, no additional text or markdown formatting.`;
     }
 
-    // Call Open AI
-    const aiResponse = await callOpenAI(prompt, process.env.OPENAI_QUESTION_GEN_MODEL || 'gpt-4o', false);
+    // Call Gemini
+    const aiResponse = await callGemini(prompt, process.env.GEMINI_QUESTION_GEN_MODEL || 'gemini-2.5-flash', false);
 
 
     console.log('🤖 AI Response received');
@@ -1057,7 +1057,7 @@ Return ONLY the JSON array, no additional text.`;
 
     try {
 
-      const aiResponse = await callOpenAI(questionFeedbackPrompt, process.env.OPENAI_MODEL || 'gpt-4o', false);
+      const aiResponse = await callGemini(questionFeedbackPrompt, process.env.GEMINI_MODEL || 'gemini-2.5-flash', false);
 
 
       console.log('🤖 Question feedback AI response received');
@@ -1455,7 +1455,7 @@ Return ONLY the JSON object, no additional text.` : null;
       try {
         console.log('📊 Calling API 1/3: Overview & Growth...');
 
-        const aiResponse = await callOpenAI(overviewPrompt, process.env.OPENAI_MODEL || 'gpt-4o', false);
+        const aiResponse = await callGemini(overviewPrompt, process.env.GEMINI_MODEL || 'gemini-2.5-flash', false);
 
         // Parse the response
         let parsedOverview;
@@ -1491,7 +1491,7 @@ Return ONLY the JSON object, no additional text.` : null;
       try {
         console.log('📊 Calling API 2/3: Scoring...');
 
-        const aiResponseScoring = await callOpenAI(scoringPrompt, process.env.OPENAI_MODEL || 'gpt-4o', false);
+        const aiResponseScoring = await callGemini(scoringPrompt, process.env.GEMINI_MODEL || 'gemini-2.5-flash', false);
 
         // Parse the response
         let parsedScoring;
@@ -1534,8 +1534,8 @@ Return ONLY the JSON object, no additional text.` : null;
             areasForImprovement: ["First improvement suggestion", "Second improvement", "Third improvement"]
           }, null, 2);
 
-          // Use callOpenAI with jsonMode=true
-          const visualParsed = await callOpenAI(visualAnalysisPrompt + '\n\nIMPORTANT: Return only the JSON object exactly matching the schema provided. Both fields MUST be arrays of strings.', process.env.OPENAI_MODEL || 'gpt-4o', true);
+          // Use callGemini with jsonMode=true
+          const visualParsed = await callGemini(visualAnalysisPrompt + '\n\nIMPORTANT: Return only the JSON object exactly matching the schema provided. Both fields MUST be arrays of strings.', process.env.GEMINI_MODEL || 'gemini-2.5-flash', true);
 
 
           if (visualParsed) {

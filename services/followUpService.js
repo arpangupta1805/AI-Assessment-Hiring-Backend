@@ -2,7 +2,7 @@
 // Phase 2: Adaptive, context-aware follow-up questions
 
 
-import { callOpenAI } from '../lib/openai.js';
+import { callGemini } from '../lib/gemini.js';
 
 // Helper: extract first balanced JSON object from text by tracking brace depth
 // (Kept as fallback/utility, though callOpenAI handles most cases)
@@ -125,7 +125,7 @@ Return ONLY the JSON object, no additional text or markdown.`;
 
     // Use low temperature for more deterministic, conservative decisions
     // callOpenAI returns parsed object when jsonMode is true
-    const result = await callOpenAI(prompt, process.env.SMALLER_MODEL || 'gpt-4o', true);
+    const result = await callGemini(prompt, process.env.GEMINI_MODEL || 'gemini-2.5-flash', true);
 
 
     // Ensure confidence is a number between 0 and 1
@@ -218,7 +218,7 @@ Create ONE concise, probing follow-up question that:
 Return ONLY the JSON object, no additional text or markdown.`;
 
     // callOpenAI with jsonMode=true
-    const result = await callOpenAI(prompt, 'gpt-4o', true);
+    const result = await callGemini(prompt, 'gemini-2.5-flash', true);
 
 
     // Normalize fields
@@ -231,7 +231,7 @@ Return ONLY the JSON object, no additional text or markdown.`;
       const retryPrompt = prompt + '\n\nPlease ensure the follow-up question is NOT a repeat of previous questions and is more specific.';
 
       try {
-        const retryResult = await callOpenAI(retryPrompt, 'gpt-4o', true, 1);
+        const retryResult = await callGemini(retryPrompt, 'gemini-2.5-flash', true, 1);
 
         if (retryResult) {
           followUpQuestion = sanitizeString(retryResult.follow_up_question || retryResult.followUpQuestion || followUpQuestion, 500);

@@ -1,6 +1,6 @@
 import express from 'express';
 import { body, validationResult } from 'express-validator';
-import { callOpenAI } from '../lib/openai.js';
+import { callGemini } from '../lib/gemini.js';
 import JobDescription from '../models/JobDescription.js';
 import CandidateAssessment from '../models/CandidateAssessment.js';
 import AssessmentSet from '../models/AssessmentSet.js';
@@ -714,7 +714,7 @@ ${resumeText.substring(0, 4000)}
 Return ONLY valid JSON.`;
 
         try {
-            const analysis = await callOpenAI(prompt, process.env.OPENAI_MODEL || 'gpt-4o', true, 3, 0.1);
+            const analysis = await callGemini(prompt, process.env.GEMINI_MODEL || 'gemini-2.5-flash', true, 3, 0.1);
 
             // Get threshold from JD (Update default to 70 in logic too)
             const threshold = jd.assessmentConfig?.resumeMatchThreshold || 70;

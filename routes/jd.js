@@ -1,6 +1,6 @@
 import express from 'express';
 import { body, validationResult, param } from 'express-validator';
-import { callOpenAI } from '../lib/openai.js';
+import { callGemini } from '../lib/gemini.js';
 import JobDescription from '../models/JobDescription.js';
 import AssessmentSet from '../models/AssessmentSet.js';
 import { authenticateToken, requireRecruiter } from '../middleware/auth.js';
@@ -66,7 +66,7 @@ IMPORTANT GUIDELINES:
 Return ONLY valid JSON, no markdown.`;
 
   try {
-    const parsed = await callOpenAI(prompt, process.env.OPENAI_MODEL || 'gpt-4o', true);
+    const parsed = await callGemini(prompt, process.env.GEMINI_MODEL || 'gemini-2.5-flash', true);
     return { success: true, data: parsed };
   } catch (error) {
     console.error('❌ AI parsing error:', error);
@@ -291,7 +291,7 @@ router.post('/:id/parse', authenticateToken, requireRecruiter, async (req, res) 
       jd.parsingMeta = {
         parsedAt: new Date(),
         parseErrors: [parseResult.error],
-        aiModel: process.env.OPENAI_MODEL || 'gpt-4o',
+        aiModel: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
       };
       await jd.save();
 
@@ -328,7 +328,7 @@ router.post('/:id/parse', authenticateToken, requireRecruiter, async (req, res) 
     jd.parsingMeta = {
       parsedAt: new Date(),
       parseErrors: [],
-      aiModel: process.env.OPENAI_MODEL || 'gpt-4o',
+      aiModel: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
     };
 
     await jd.save();
@@ -851,7 +851,7 @@ async function generateQuestionSets(jdId) {
         programmingQuestions: [],
         generationMeta: {
           generatedAt: new Date(),
-          aiModel: process.env.OPENAI_MODEL || 'gpt-4o',
+          aiModel: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
         },
       };
 
@@ -958,7 +958,7 @@ IMPORTANT: You MUST use the exact keys: "questionId", "questionText", "options",
 Return ONLY valid JSON.`;
 
   try {
-    const response = await callOpenAI(prompt, process.env.OPENAI_QUESTION_GEN_MODEL || 'gpt-4o', true);
+    const response = await callGemini(prompt, process.env.GEMINI_QUESTION_GEN_MODEL || 'gemini-2.5-flash', true);
     console.log('🔹 Objective Questions Response:', JSON.stringify(response, null, 2));
 
     // Handle both array and object responses for robustness
@@ -1023,7 +1023,7 @@ IMPORTANT: You MUST use the exact keys: "questionId", "questionText", "expectedA
 Return ONLY valid JSON.`;
 
   try {
-    const response = await callOpenAI(prompt, process.env.OPENAI_QUESTION_GEN_MODEL || 'gpt-4o', true);
+    const response = await callGemini(prompt, process.env.GEMINI_QUESTION_GEN_MODEL || 'gemini-2.5-flash', true);
     console.log('🔹 Subjective Questions Response:', JSON.stringify(response, null, 2));
 
     let questions = [];
@@ -1097,7 +1097,7 @@ IMPORTANT: You MUST use the exact keys: "questionId", "title", "questionText", "
 Return ONLY valid JSON.`;
 
   try {
-    const response = await callOpenAI(prompt, process.env.OPENAI_QUESTION_GEN_MODEL || 'gpt-4o', true);
+    const response = await callGemini(prompt, process.env.GEMINI_QUESTION_GEN_MODEL || 'gemini-2.5-flash', true);
     console.log('🔹 Programming Questions Response:', JSON.stringify(response, null, 2));
 
     let questions = [];

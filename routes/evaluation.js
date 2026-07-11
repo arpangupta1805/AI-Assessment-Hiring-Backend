@@ -1,6 +1,6 @@
 import express from 'express';
 import { body, validationResult } from 'express-validator';
-import { callOpenAI } from '../lib/openai.js';
+import { callGemini } from '../lib/gemini.js';
 import CandidateAssessment from '../models/CandidateAssessment.js';
 import AssessmentAnswer from '../models/AssessmentAnswer.js';
 import Evaluation from '../models/Evaluation.js';
@@ -536,7 +536,7 @@ Analyze the answer and return JSON:
 Be fair but strict. Return ONLY valid JSON.`;
 
     try {
-        return await callOpenAI(prompt, process.env.OPENAI_MODEL || 'gpt-4o', true);
+        return await callGemini(prompt, process.env.GEMINI_MODEL || 'gemini-2.5-flash', true);
     } catch (error) {
         console.error('❌ AI grading error:', error);
         return {

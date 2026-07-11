@@ -1,5 +1,5 @@
 
-import { callOpenAI } from '../lib/openai.js';
+import { callGemini } from '../lib/gemini.js';
 
 class OAScoringService {
 
@@ -107,9 +107,9 @@ Respond ONLY in JSON format:
 }`;
 
         try {
-            const modelName = process.env.OPENAI_MODEL || 'gpt-4o';
+            const modelName = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
             // Force JSON mode for better reliability
-            const data = await callOpenAI(prompt, modelName, true);
+            const data = await callGemini(prompt, modelName, true);
 
             // callOpenAI returns parsed object when jsonMode is true
             return {
@@ -166,9 +166,9 @@ IMPORTANT: Respond in PLAIN TEXT JSON format. Do NOT use markdown code blocks, d
 }`;
 
         try {
-            const modelName = process.env.OPENAI_MODEL || 'gpt-4o';
+            const modelName = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
             // Force JSON mode
-            const parsed = await callOpenAI(prompt, modelName, true);
+            const parsed = await callGemini(prompt, modelName, true);
 
             return {
                 yourApproach: parsed.yourApproach || 'Analyzed by AI',
@@ -592,11 +592,11 @@ Return this exact JSON structure:
 }`;
 
         try {
-            const modelName = process.env.OPENAI_QUESTION_GEN_MODEL || 'gpt-4o';
+            const modelName = process.env.GEMINI_QUESTION_GEN_MODEL || 'gemini-2.5-flash';
 
             // Generate content using OpenAI with JSON mode enforce
             // We can ask OpenAI for JSON response directly
-            const result = await callOpenAI(prompt, modelName, true);
+            const result = await callGemini(prompt, modelName, true);
 
             console.log('✅ Successfully parsed question:', result.questionId);
 
@@ -732,19 +732,19 @@ Return this exact JSON structure (an array of ${questionCount} questions):
 
         try {
             console.log(`🚀 Generating ${questionCount} questions in batch mode...`);
-            const modelName = process.env.OPENAI_QUESTION_GEN_MODEL || 'gpt-4o';
+            const modelName = process.env.GEMINI_QUESTION_GEN_MODEL || 'gemini-2.5-flash';
             console.log(`📡 Using model: ${modelName}`);
 
             let aiResponse;
             try {
-                aiResponse = await callOpenAI(prompt, modelName, false);
+                aiResponse = await callGemini(prompt, modelName, false);
             } catch (apiError) {
-                console.error('❌ callOpenAI threw an error:', apiError);
+                console.error('❌ callGemini threw an error:', apiError);
                 throw apiError;
             }
 
             if (!aiResponse) {
-                throw new Error('No data returned from OpenAI API');
+                throw new Error('No data returned from Gemini API');
             }
 
 
